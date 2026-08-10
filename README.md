@@ -6,7 +6,7 @@
 
 ```python
 from sat4sc import pysphere
-from sat4sc import plotting
+from sat4sc import pysphere_plotting
 ```
 
 ## 1. 目录结构
@@ -19,7 +19,7 @@ sat4sc/
 └── sat4sc/
     ├── __init__.py
     ├── pysphere.py      # 计算：SPHERE、projected score、magnitude、pairwise matrix、module score
-    └── plotting.py      # 绘图：Figure 3A/3B/3F/4B 风格图，以及 magnitude plot
+    └── pysphere_plotting.py      # 绘图：Figure 3A/3B/3F/4B 风格图，以及 magnitude plot
 ```
 
 ## 2. 与原 SPHERE R 包的对应关系
@@ -33,13 +33,13 @@ sat4sc/
 | `spatial_vectorX()` | `pysphere.spatial_vector_x()` / `pysphere.spatial_vectorX()` |
 | `spatial_vecProj()` | `pysphere.spatial_vec_proj()` |
 | `spatial_vecMagnitude()` | `pysphere.spatial_vec_magnitude()` |
-| `spatial_vecPlot()` | `plotting.plot_vector()` |
-| `spatial_magPlot()` | `plotting.plot_magnitude_projected()` |
-| `spatial_adjust(..., plot=TRUE)` | `plotting.plot_spatial_adjusted()` |
-| `spatial_cordstat(..., plot_bin=TRUE)` | `plotting.plot_spatial_overlap()` |
-| Figure 3A pairwise heatmap | `pysphere.pairwise_projected_scores()` + `plotting.plot_projected_heatmap()` |
-| Figure 3F paired score | `plotting.plot_paired_projected_scores()` |
-| Figure 4B distribution + pie | `plotting.plot_colocalization_distribution()` |
+| `spatial_vecPlot()` | `pysphere_plotting.plot_vector()` |
+| `spatial_magPlot()` | `pysphere_plotting.plot_magnitude_projected()` |
+| `spatial_adjust(..., plot=TRUE)` | `pysphere_plotting.plot_spatial_adjusted()` |
+| `spatial_cordstat(..., plot_bin=TRUE)` | `pysphere_plotting.plot_spatial_overlap()` |
+| Figure 3A pairwise heatmap | `pysphere.pairwise_projected_scores()` + `pysphere_plotting.plot_projected_heatmap()` |
+| Figure 3F paired score | `pysphere_plotting.plot_paired_projected_scores()` |
+| Figure 4B distribution + pie | `pysphere_plotting.plot_colocalization_distribution()` |
 
 ## 3. 安装
 
@@ -52,7 +52,7 @@ pip install -e .
 之后：
 
 ```python
-from sat4sc import pysphere, plotting
+from sat4sc import pysphere, pysphere_plotting
 ```
 
 依赖只有：`numpy`, `pandas`, `scipy`, `anndata`, `matplotlib`。
@@ -228,7 +228,7 @@ adata.obs["MES2"]
 # 8. 单个样本：对应 `spatial_vector()`
 
 ```python
-from sat4sc import pysphere, plotting
+from sat4sc import pysphere, pysphere_plotting
 
 rs = pysphere.spatial_vector(
     adata,
@@ -248,7 +248,7 @@ rs.vector_len
 Figure 3B 风格：
 
 ```python
-fig, ax = plotting.plot_vector(rs)
+fig, ax = pysphere_plotting.plot_vector(rs)
 fig.savefig("Figure3B_like.pdf", bbox_inches="tight")
 fig.savefig("Figure3B_like.png", dpi=600, bbox_inches="tight")
 ```
@@ -326,7 +326,7 @@ pair_rs.sample_scores
 绘图：
 
 ```python
-fig, ax = plotting.plot_projected_heatmap(
+fig, ax = pysphere_plotting.plot_projected_heatmap(
     pair_rs,
     order=features,
     triangle="lower",
@@ -354,7 +354,7 @@ rs_hypoxia = pysphere.spatial_vector_x(
     grid_size=20,
 )
 
-fig, ax = plotting.plot_vector(
+fig, ax = pysphere_plotting.plot_vector(
     rs_hypoxia,
     title=f"relation to {rs_hypoxia.target}",
 )
@@ -379,7 +379,7 @@ rs_tumor = pysphere.spatial_vector_x(
 绘制 HIF1A vs EPAS1：
 
 ```python
-fig, ax, stat = plotting.plot_paired_projected_scores(
+fig, ax, stat = pysphere_plotting.plot_paired_projected_scores(
     rs_tumor,
     feature_a="HIF1A",
     feature_b="EPAS1",
@@ -410,7 +410,7 @@ rs_hi = pysphere.spatial_vector_x(
 绘图：
 
 ```python
-fig, ax, stat = plotting.plot_colocalization_distribution(
+fig, ax, stat = pysphere_plotting.plot_colocalization_distribution(
     rs_hi,
     feature="inflammation",
     threshold=0,
@@ -581,7 +581,7 @@ Xenium centroid 是连续坐标，不存在 Visium 的固定 spot lattice，因�
 # 18. 最简完整示例
 
 ```python
-from sat4sc import pysphere, plotting
+from sat4sc import pysphere, pysphere_plotting
 
 # 假设 hypoxia / inflammation 已经在 adata.obs
 rs = pysphere.spatial_vector_x(
@@ -597,7 +597,7 @@ rs = pysphere.spatial_vector_x(
 print(rs.projected_score)
 print(rs.sample_projected_score.head())
 
-fig, ax, stat = plotting.plot_colocalization_distribution(
+fig, ax, stat = pysphere_plotting.plot_colocalization_distribution(
     rs,
     feature="inflammation",
     threshold=0,
