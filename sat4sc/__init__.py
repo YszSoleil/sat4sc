@@ -5,6 +5,6 @@ from . import pysphere, pysphere_plotting
 # Backward-compatible attribute alias. The module file itself is now
 # ``pysphere_plotting.py``; new code should import ``pysphere_plotting``.
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 __all__ = ["pysphere", "pysphere_plotting"]

@@ -8,7 +8,7 @@ score density + co-localization proportion summaries.
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Mapping, Sequence
 import math
 
 import numpy as np
@@ -19,7 +19,7 @@ from matplotlib.cm import ScalarMappable
 from scipy.stats import gaussian_kde, norm, wilcoxon
 
 from .pysphere import (
-    BinStatResult, GridFeatureMap, KDTreeDomainResult, PairwiseResult,
+    BinStatResult, CutoffResult, GridFeatureMap, KDTreeDomainResult, PairwiseResult,
     SpatialAdjusted, SpatialVectorResult,
 )
 
@@ -467,21 +467,39 @@ def plot_spatial_overlap(
     obj1: SpatialAdjusted,
     obj2: SpatialAdjusted,
     ax=None,
-    cutoffs: tuple[float, float] | None = None,
+    cutoffs=None,
     shift: tuple[float, float] = (0.0, 0.0),
     point_size: float = 5.0,
     colors: tuple[str, str] = ("orange", "steelblue"),
     invert_y: bool = False,
 ):
-    """Binary spatial overlay analogous to spatial_cordstat(..., plot_bin=TRUE)."""
+    """Binary spatial overlay analogous to ``spatial_cordstat(..., plot_bin=TRUE)``.
+
+    ``cutoffs`` may be the legacy two-value tuple, a feature-keyed mapping, a
+    pandas Series, or a :class:`sat4sc.pysphere.CutoffResult` returned by
+    ``pysphere.calculate_cutoffs``. ``None`` retains local mean thresholds.
+    """
     if obj1.values is None or obj2.values is None:
         raise ValueError("Both objects require feature values.")
     if ax is None:
         fig, ax = plt.subplots(figsize=(5.5, 5.5))
     else:
         fig = ax.figure
-    c1 = float(np.nanmean(obj1.values)) if cutoffs is None else float(cutoffs[0])
-    c2 = float(np.nanmean(obj2.values)) if cutoffs is None else float(cutoffs[1])
+    if cutoffs is None:
+        c1 = float(np.nanmean(obj1.values))
+        c2 = float(np.nanmean(obj2.values))
+    elif isinstance(cutoffs, CutoffResult):
+        mapping = cutoffs.cutoffs.to_dict()
+        if obj1.feature not in mapping or obj2.feature not in mapping:
+            raise KeyError("CutoffResult must contain both object feature names.")
+        c1, c2 = float(mapping[obj1.feature]), float(mapping[obj2.feature])
+    elif isinstance(cutoffs, Mapping) or isinstance(cutoffs, pd.Series):
+        mapping = dict(cutoffs)
+        if obj1.feature not in mapping or obj2.feature not in mapping:
+            raise KeyError("cutoffs mapping must contain both object feature names.")
+        c1, c2 = float(mapping[obj1.feature]), float(mapping[obj2.feature])
+    else:
+        c1, c2 = map(float, cutoffs)
     a = np.asarray(obj1.values) > c1
     b = np.asarray(obj2.values) > c2
     ax.scatter(obj1.coords[a, 0], obj1.coords[a, 1], s=point_size, color=colors[0], edgecolor="none", label=obj1.feature, rasterized=True)
@@ -494,6 +512,7 @@ def plot_spatial_overlap(
     ax.legend(frameon=False)
     ax.set_title(f"{obj1.feature}:{obj2.feature}")
     return fig, ax
+
 
 
 def plot_binstat(
@@ -601,6 +620,13 @@ def plot_binary_overlay(
     agg: str = "mean",
     cutoff1=None,
     cutoff2=None,
+    cutoff_method: str | None = None,
+    cohort_cutoffs=None,
+    cutoff_samples: Sequence[str] | None = None,
+    cutoff_n_repeats: int = 100,
+    cutoff_balance_round_to: int = 1000,
+    cutoff_balance_n: int | None = None,
+    cutoff_random_state: int = 666,
     min_cells_per_bin: int = 1,
     ax=None,
     point_size: float = 5.0,
@@ -614,28 +640,16 @@ def plot_binary_overlay(
 ):
     """High-level two-feature binary spatial overlay directly from AnnData.
 
-    Parameters
-    ----------
-    adata
-        AnnData object containing coordinates plus feature values. ``feature1``
-        and ``feature2`` may be numeric ``adata.obs`` columns or genes in
-        ``adata.var_names``.
-    feature1, feature2
-        Features to binarize and overlay. Feature 1 is drawn as a filled domain;
-        feature 2 is drawn as an outline/open-marker domain.
-    space
-        ``"cell"`` keeps the original cell/spot coordinates and is the high-level
-        counterpart of :func:`plot_spatial_overlap`. ``"grid"`` first rasterizes
-        both features with :func:`sat4sc.pysphere.grid_feature_map`, so the plot
-        shows the same equal-area spatial units used by ``backend="grid"``.
-    cutoff1, cutoff2
-        ``None``/``"mean"`` (SPHERE default), ``"median"``, ``"zero"``, a
-        numeric cutoff, or ``("quantile", q)``.
+    ``space='cell'`` thresholds original cells/spots; ``space='grid'`` thresholds
+    rasterized grid scores. Set ``cutoff_method`` to one of
+    ``median_of_sample_medians``, ``mean_of_sample_means``,
+    ``balanced_global_median`` or ``balanced_global_mean`` to use the same
+    cohort-wide cutoff in every sample. ``cohort_cutoffs`` can instead receive a
+    precomputed mapping/Series/CutoffResult. Explicit ``cutoff1`` or ``cutoff2``
+    overrides the cohort cutoff for that feature.
 
-    Returns
-    -------
-    fig, ax, info
-        ``info`` records the resolved cutoffs and positive/overlap counts.
+    Legacy local cutoff specifications are still supported: ``None``/``'mean'``,
+    ``'median'``, ``'zero'``, a numeric value, or ``('quantile', q)``.
     """
     from . import pysphere as _pysphere
 
@@ -647,24 +661,45 @@ def plot_binary_overlay(
     else:
         fig = ax.figure
 
+    cohort_map = _pysphere._coerce_cutoff_mapping(cohort_cutoffs)
+    need_global = []
+    if cutoff1 is None and feature1 not in cohort_map and cutoff_method is not None:
+        need_global.append(feature1)
+    if cutoff2 is None and feature2 not in cohort_map and cutoff_method is not None:
+        need_global.append(feature2)
+    cutoff_result = None
+    if need_global:
+        cutoff_result = _pysphere.calculate_cutoffs(
+            adata,
+            features=list(dict.fromkeys(need_global)),
+            sample_key=sample_key,
+            samples=cutoff_samples,
+            level=space,
+            method=cutoff_method,
+            coord_cols=coord_cols,
+            spatial_key=spatial_key,
+            layer=layer,
+            grid_size=grid_size,
+            agg=agg,
+            min_cells_per_bin=min_cells_per_bin,
+            n_repeats=cutoff_n_repeats,
+            balance_round_to=cutoff_balance_round_to,
+            balance_n=cutoff_balance_n,
+            random_state=cutoff_random_state,
+        )
+        cohort_map.update(cutoff_result.cutoffs.to_dict())
+
+    resolved_spec1 = cutoff1 if cutoff1 is not None else cohort_map.get(feature1, None)
+    resolved_spec2 = cutoff2 if cutoff2 is not None else cohort_map.get(feature2, None)
+
     if space == "cell":
         obj1 = _pysphere.spatial_adjust(
-            adata,
-            feature=feature1,
-            sample=sample,
-            sample_key=sample_key,
-            coord_cols=coord_cols,
-            spatial_key=spatial_key,
-            layer=layer,
+            adata, feature=feature1, sample=sample, sample_key=sample_key,
+            coord_cols=coord_cols, spatial_key=spatial_key, layer=layer,
         )
         obj2 = _pysphere.spatial_adjust(
-            adata,
-            feature=feature2,
-            sample=sample,
-            sample_key=sample_key,
-            coord_cols=coord_cols,
-            spatial_key=spatial_key,
-            layer=layer,
+            adata, feature=feature2, sample=sample, sample_key=sample_key,
+            coord_cols=coord_cols, spatial_key=spatial_key, layer=layer,
         )
         if obj1.values is None or obj2.values is None:
             raise ValueError("Both features require numeric values.")
@@ -672,124 +707,74 @@ def plot_binary_overlay(
             raise ValueError("feature1 and feature2 did not resolve to the same spatial coordinates.")
         values1 = np.asarray(obj1.values, dtype=float)
         values2 = np.asarray(obj2.values, dtype=float)
-        c1 = _resolve_binary_overlay_cutoff(values1, cutoff1)
-        c2 = _resolve_binary_overlay_cutoff(values2, cutoff2)
+        c1 = _resolve_binary_overlay_cutoff(values1, resolved_spec1)
+        c2 = _resolve_binary_overlay_cutoff(values2, resolved_spec2)
         pos1 = np.isfinite(values1) & (values1 > c1)
         pos2 = np.isfinite(values2) & (values2 > c2)
         coords = np.asarray(obj1.coords, dtype=float)
         if show_background:
-            ax.scatter(
-                coords[:, 0], coords[:, 1], s=background_size,
-                color=background_color, edgecolor="none", rasterized=True, zorder=1,
-            )
+            ax.scatter(coords[:, 0], coords[:, 1], s=background_size, color=background_color, edgecolor="none", rasterized=True, zorder=1)
         if pos1.any():
-            ax.scatter(
-                coords[pos1, 0], coords[pos1, 1], s=point_size,
-                color=colors[0], edgecolor="none", label=feature1,
-                rasterized=True, zorder=2,
-            )
+            ax.scatter(coords[pos1, 0], coords[pos1, 1], s=point_size, color=colors[0], edgecolor="none", label=feature1, rasterized=True, zorder=2)
         if pos2.any():
-            ax.scatter(
-                coords[pos2, 0], coords[pos2, 1], s=point_size,
-                facecolors="none", edgecolors=colors[1], linewidths=feature2_linewidth,
-                label=feature2, rasterized=True, zorder=3,
-            )
+            ax.scatter(coords[pos2, 0], coords[pos2, 1], s=point_size, facecolors="none", edgecolors=colors[1], linewidths=feature2_linewidth, label=feature2, rasterized=True, zorder=3)
         info = {
-            "space": "cell",
-            "sample": sample,
-            "feature1": feature1,
-            "feature2": feature2,
-            "cutoff1": c1,
-            "cutoff2": c2,
-            "n_units": int(coords.shape[0]),
-            "n_feature1_positive": int(pos1.sum()),
-            "n_feature2_positive": int(pos2.sum()),
-            "n_overlap": int((pos1 & pos2).sum()),
+            "space": "cell", "sample": sample, "feature1": feature1, "feature2": feature2,
+            "cutoff1": c1, "cutoff2": c2, "cutoff_method": cutoff_method,
+            "n_units": int(len(coords)), "n_feature1_positive": int(pos1.sum()),
+            "n_feature2_positive": int(pos2.sum()), "n_overlap": int((pos1 & pos2).sum()),
+            "feature1_positive_fraction": float(pos1.mean()) if len(pos1) else np.nan,
+            "feature2_positive_fraction": float(pos2.mean()) if len(pos2) else np.nan,
         }
     else:
         map1 = _pysphere.grid_feature_map(
-            adata,
-            feature=feature1,
-            sample=sample,
-            sample_key=sample_key,
-            coord_cols=coord_cols,
-            spatial_key=spatial_key,
-            layer=layer,
-            grid_size=grid_size,
-            agg=agg,
-            min_cells_per_bin=min_cells_per_bin,
+            adata, feature=feature1, sample=sample, sample_key=sample_key,
+            coord_cols=coord_cols, spatial_key=spatial_key, layer=layer,
+            grid_size=grid_size, agg=agg, min_cells_per_bin=min_cells_per_bin,
         )
         map2 = _pysphere.grid_feature_map(
-            adata,
-            feature=feature2,
-            sample=sample,
-            sample_key=sample_key,
-            coord_cols=coord_cols,
-            spatial_key=spatial_key,
-            layer=layer,
-            grid_size=grid_size,
-            agg=agg,
-            min_cells_per_bin=min_cells_per_bin,
+            adata, feature=feature2, sample=sample, sample_key=sample_key,
+            coord_cols=coord_cols, spatial_key=spatial_key, layer=layer,
+            grid_size=grid_size, agg=agg, min_cells_per_bin=min_cells_per_bin,
         )
-        if map1.grid.shape != map2.grid.shape or not np.allclose(map1.x_edges, map2.x_edges) or not np.allclose(map1.y_edges, map2.y_edges):
-            raise ValueError("feature1 and feature2 did not rasterize to the same grid.")
         occupied = np.asarray(map1.occupied & map2.occupied, dtype=bool)
         values1 = np.asarray(map1.grid, dtype=float)
         values2 = np.asarray(map2.grid, dtype=float)
-        c1 = _resolve_binary_overlay_cutoff(values1[occupied], cutoff1)
-        c2 = _resolve_binary_overlay_cutoff(values2[occupied], cutoff2)
+        c1 = _resolve_binary_overlay_cutoff(values1[occupied], resolved_spec1)
+        c2 = _resolve_binary_overlay_cutoff(values2[occupied], resolved_spec2)
         pos1 = occupied & np.isfinite(values1) & (values1 > c1)
         pos2 = occupied & np.isfinite(values2) & (values2 > c2)
         from matplotlib.colors import ListedColormap
         if show_background:
             bg = np.ma.masked_where(~occupied, np.ones_like(values1, dtype=float))
-            ax.pcolormesh(
-                map1.x_edges, map1.y_edges, bg,
-                cmap=ListedColormap([background_color]), shading="flat",
-                vmin=0, vmax=1, rasterized=True, zorder=1,
-            )
+            ax.pcolormesh(map1.x_edges, map1.y_edges, bg, cmap=ListedColormap([background_color]), shading="flat", vmin=0, vmax=1, rasterized=True, zorder=1)
         fill1 = np.ma.masked_where(~pos1, np.ones_like(values1, dtype=float))
         if pos1.any():
-            ax.pcolormesh(
-                map1.x_edges, map1.y_edges, fill1,
-                cmap=ListedColormap([colors[0]]), shading="flat",
-                vmin=0, vmax=1, rasterized=True, zorder=2,
-            )
+            ax.pcolormesh(map1.x_edges, map1.y_edges, fill1, cmap=ListedColormap([colors[0]]), shading="flat", vmin=0, vmax=1, rasterized=True, zorder=2)
         if pos2.any():
             xc = (map2.x_edges[:-1] + map2.x_edges[1:]) / 2.0
             yc = (map2.y_edges[:-1] + map2.y_edges[1:]) / 2.0
             if pos2.shape[0] > 1 and pos2.shape[1] > 1 and (~pos2).any():
-                ax.contour(
-                    xc, yc, pos2.astype(float), levels=[0.5],
-                    colors=[colors[1]], linewidths=feature2_linewidth, zorder=3,
-                )
+                ax.contour(xc, yc, pos2.astype(float), levels=[0.5], colors=[colors[1]], linewidths=feature2_linewidth, zorder=3)
             else:
                 yy, xx = np.where(pos2)
                 if len(xx):
-                    ax.scatter(
-                        xc[xx], yc[yy], marker="s", s=max(point_size * 3.0, 12.0),
-                        facecolors="none", edgecolors=colors[1], linewidths=feature2_linewidth,
-                        rasterized=True, zorder=3,
-                    )
+                    ax.scatter(xc[xx], yc[yy], marker="s", s=max(point_size * 3.0, 12.0), facecolors="none", edgecolors=colors[1], linewidths=feature2_linewidth, rasterized=True, zorder=3)
         from matplotlib.lines import Line2D
         handles = [
             Line2D([0], [0], marker="s", linestyle="none", markerfacecolor=colors[0], markeredgecolor="none", markersize=8, label=feature1),
             Line2D([0], [0], marker="s", linestyle="none", markerfacecolor="none", markeredgecolor=colors[1], markersize=8, label=feature2),
         ]
         ax.legend(handles=handles, frameon=False)
+        n_units = int(occupied.sum())
         info = {
-            "space": "grid",
-            "sample": sample,
-            "feature1": feature1,
-            "feature2": feature2,
-            "cutoff1": c1,
-            "cutoff2": c2,
-            "grid_size": float(grid_size),
-            "agg": str(agg),
-            "n_units": int(occupied.sum()),
-            "n_feature1_positive": int(pos1.sum()),
-            "n_feature2_positive": int(pos2.sum()),
+            "space": "grid", "sample": sample, "feature1": feature1, "feature2": feature2,
+            "cutoff1": c1, "cutoff2": c2, "cutoff_method": cutoff_method,
+            "grid_size": float(grid_size), "agg": str(agg), "n_units": n_units,
+            "n_feature1_positive": int(pos1.sum()), "n_feature2_positive": int(pos2.sum()),
             "n_overlap": int((pos1 & pos2).sum()),
+            "feature1_positive_fraction": np.nan if n_units == 0 else float(pos1.sum() / n_units),
+            "feature2_positive_fraction": np.nan if n_units == 0 else float(pos2.sum() / n_units),
         }
 
     ax.set_aspect("equal")
@@ -802,6 +787,7 @@ def plot_binary_overlay(
     if space == "cell":
         ax.legend(frameon=False)
     return fig, ax, info
+
 
 
 __all__.append("plot_binary_overlay")

@@ -27,6 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Sequence
 import warnings
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -154,6 +155,384 @@ class KDTreeDomainResult:
     coverage_fraction: float = 1.0
 
 
+CUTOFF_METHODS = (
+    "median_of_sample_medians",
+    "mean_of_sample_means",
+    "balanced_global_median",
+    "balanced_global_mean",
+)
+
+
+@dataclass
+class CutoffResult:
+    """Cohort-level feature cutoffs for comparable positive cell/grid calls.
+
+    ``cutoffs`` contains one cohort-wide threshold per feature. ``sample_stats``
+    records per-sample means/medians and unit counts. For balanced methods,
+    ``replicate_cutoffs`` stores the cutoff from every repeated equal-size
+    subsampling iteration.
+    """
+
+    cutoffs: pd.Series
+    sample_stats: pd.DataFrame
+    replicate_cutoffs: pd.DataFrame | None
+    settings: dict = field(default_factory=dict)
+
+
+def _normalize_cutoff_level(level: str) -> str:
+    key = str(level).lower().replace("-", "_")
+    aliases = {
+        "cell": "cell", "cells": "cell", "cell_level": "cell",
+        "grid": "grid", "grids": "grid", "grid_level": "grid",
+    }
+    if key not in aliases:
+        raise ValueError("level must be 'cell'/'cell_level' or 'grid'/'grid_level'.")
+    return aliases[key]
+
+
+def _normalize_cutoff_method(method: str) -> str:
+    key = str(method).lower().replace("-", "_")
+    aliases = {
+        "median_of_sample_level_median_scores": "median_of_sample_medians",
+        "median_of_sample_level_medians": "median_of_sample_medians",
+        "median_of_sample_median": "median_of_sample_medians",
+        "median_of_sample_medians": "median_of_sample_medians",
+        "mean_of_sample_level_mean_scores": "mean_of_sample_means",
+        "mean_of_sample_level_means": "mean_of_sample_means",
+        "mean_of_sample_mean": "mean_of_sample_means",
+        "mean_of_sample_means": "mean_of_sample_means",
+        "balanced_global_median": "balanced_global_median",
+        "balanced_global_mean": "balanced_global_mean",
+    }
+    if key not in aliases:
+        raise ValueError(f"Unknown cutoff method {method!r}. Supported methods: {CUTOFF_METHODS}.")
+    return aliases[key]
+
+
+def _coerce_cutoff_mapping(cutoffs) -> dict[str, float]:
+    if cutoffs is None:
+        return {}
+    if isinstance(cutoffs, CutoffResult):
+        return {str(k): float(v) for k, v in cutoffs.cutoffs.items() if np.isfinite(v)}
+    if isinstance(cutoffs, pd.Series):
+        return {str(k): float(v) for k, v in cutoffs.items() if np.isfinite(v)}
+    if isinstance(cutoffs, Mapping):
+        return {str(k): float(v) for k, v in cutoffs.items() if np.isfinite(v)}
+    raise TypeError("cutoffs must be a mapping, pandas Series, CutoffResult, or None.")
+
+
+def _resolve_feature_cutoff_input(cutoff, feature: str | None, default: float | None = None) -> float | None:
+    if isinstance(cutoff, CutoffResult):
+        mapping = _coerce_cutoff_mapping(cutoff)
+        if feature is None or feature not in mapping:
+            raise KeyError(f"Cannot resolve cutoff for feature {feature!r} from CutoffResult.")
+        return mapping[feature]
+    if isinstance(cutoff, Mapping) or isinstance(cutoff, pd.Series):
+        mapping = _coerce_cutoff_mapping(cutoff)
+        if feature is None or feature not in mapping:
+            raise KeyError(f"Cannot resolve cutoff for feature {feature!r} from cutoff mapping.")
+        return mapping[feature]
+    if cutoff is None:
+        return default
+    return float(cutoff)
+
+
+def _resolve_cutoff_samples(adata: AnnData, sample_key: str, samples: Sequence[str] | None) -> list[str]:
+    if sample_key not in adata.obs.columns:
+        raise KeyError(f"sample_key {sample_key!r} not found in adata.obs.")
+    available = adata.obs[sample_key].astype(str).to_numpy()
+    if samples is None:
+        return list(pd.unique(available))
+    out = list(map(str, samples))
+    missing = [s for s in out if not np.any(available == s)]
+    if missing:
+        raise ValueError(f"No observations found for samples: {missing}.")
+    return out
+
+
+def _balanced_draw_size(min_count: int, balance_round_to: int = 1000, balance_n: int | None = None) -> int:
+    if min_count <= 0:
+        raise ValueError("At least one sample has zero finite units for cutoff calculation.")
+    if balance_n is not None:
+        n = int(balance_n)
+        if n <= 0:
+            raise ValueError("balance_n must be > 0.")
+        if n > min_count:
+            raise ValueError(f"balance_n={n} exceeds the smallest sample size ({min_count}).")
+        return n
+    round_to = int(balance_round_to)
+    if round_to <= 0:
+        raise ValueError("balance_round_to must be > 0.")
+    # Example requested by the package design: 12,345 -> 12,000. If the
+    # smallest sample has <1,000 units, use the exact minimum rather than zero.
+    rounded = (int(min_count) // round_to) * round_to
+    return int(min_count) if rounded == 0 else int(rounded)
+
+
+def calculate_cutoffs(
+    adata: AnnData,
+    features: Sequence[str] | str,
+    sample_key: str = "sample_name",
+    samples: Sequence[str] | None = None,
+    level: str = "cell",
+    method: str = "median_of_sample_medians",
+    coord_cols: Sequence[str] = DEFAULT_COORD_COLS,
+    spatial_key: str = "spatial",
+    layer: str | None = None,
+    grid_size: float = 20.0,
+    agg: str = "mean",
+    min_cells_per_bin: int = 1,
+    n_repeats: int = 100,
+    balance_round_to: int = 1000,
+    balance_n: int | None = None,
+    random_state: int = 666,
+) -> CutoffResult:
+    """Calculate one cohort-wide cutoff per feature at cell or grid level.
+
+    Supported methods
+    -----------------
+    ``median_of_sample_medians``
+        Compute each sample's median score, then take the median across samples.
+    ``mean_of_sample_means``
+        Compute each sample's mean score, then take the mean across samples.
+    ``balanced_global_median``
+        For every repeat, draw an equal number of units from every sample,
+        pool them, and calculate the pooled median. The final cutoff is the
+        median of the repeat-specific pooled medians.
+    ``balanced_global_mean``
+        Same equal-size repeated sampling, but calculate the pooled mean. The
+        final cutoff is the mean of the repeat-specific pooled means.
+
+    ``level='cell'`` uses finite cell/spot feature values. ``level='grid'`` first
+    rasterizes every sample independently with the same grid settings used by
+    grid-SPHERE, then uses occupied finite grid scores as the units.
+
+    For balanced methods the default draw size is the smallest sample's finite
+    unit count rounded down to a multiple of ``balance_round_to`` (default
+    1,000; e.g. 12,345 -> 12,000). If the smallest sample has fewer than 1,000
+    units, its exact count is used. Sampling is without replacement and repeated
+    ``n_repeats=100`` times by default.
+    """
+    level = _normalize_cutoff_level(level)
+    method = _normalize_cutoff_method(method)
+    features = [str(features)] if isinstance(features, str) else list(map(str, features))
+    if not features:
+        raise ValueError("features must contain at least one feature.")
+    samples = _resolve_cutoff_samples(adata, sample_key, samples)
+    if int(n_repeats) < 1:
+        raise ValueError("n_repeats must be >= 1.")
+    sample_values_all = adata.obs[sample_key].astype(str).to_numpy()
+    sample_indices = {s: np.flatnonzero(sample_values_all == s) for s in samples}
+    grid_geometry = {}
+    if level == "grid":
+        for sample in samples:
+            idx = sample_indices[sample]
+            coords = _resolve_coords(adata, idx, coord_cols=coord_cols, spatial_key=spatial_key)
+            grid_geometry[sample] = _make_grid(coords, grid_size, min_cells_per_bin)
+
+    cutoff_values = {}
+    sample_rows = []
+    repeat_rows = []
+    balance_n_by_feature = {}
+    for feature_i, feature in enumerate(features):
+        arrays = []
+        for sample in samples:
+            idx = sample_indices[sample]
+            values = _resolve_feature_vector(adata, feature, idx, layer=layer)
+            if level == "cell":
+                arr = np.asarray(values, dtype=float)
+                arr = arr[np.isfinite(arr)]
+            else:
+                flat, counts, occupied, shape, _ = grid_geometry[sample]
+                grid = _aggregate_grid(values, flat, counts, shape, agg=agg)
+                arr = grid[occupied & np.isfinite(grid)].astype(float, copy=False)
+            if arr.size == 0:
+                raise ValueError(f"Feature {feature!r} has no finite {level} values in sample {sample!r}.")
+            arrays.append(arr)
+            sample_rows.append({
+                "feature": feature,
+                "sample": sample,
+                "level": level,
+                "n_units": int(arr.size),
+                "sample_mean": float(np.mean(arr)),
+                "sample_median": float(np.median(arr)),
+            })
+
+        if method == "median_of_sample_medians":
+            cutoff = float(np.median([np.median(x) for x in arrays]))
+        elif method == "mean_of_sample_means":
+            cutoff = float(np.mean([np.mean(x) for x in arrays]))
+        else:
+            min_count = min(len(x) for x in arrays)
+            n_draw = _balanced_draw_size(min_count, balance_round_to=balance_round_to, balance_n=balance_n)
+            balance_n_by_feature[feature] = int(n_draw)
+            # A feature-specific RNG makes results reproducible while avoiding
+            # identical draw streams for every feature.
+            feature_seed = int(zlib.crc32(feature.encode("utf-8")))
+            rng = np.random.default_rng(np.random.SeedSequence([int(random_state), feature_seed]))
+            rep_vals = []
+            for rep in range(int(n_repeats)):
+                drawn = []
+                for arr in arrays:
+                    if len(arr) == n_draw:
+                        sub = arr
+                    else:
+                        take = rng.choice(len(arr), size=n_draw, replace=False)
+                        sub = arr[take]
+                    drawn.append(sub)
+                pooled = np.concatenate(drawn)
+                rep_cutoff = float(np.median(pooled) if method == "balanced_global_median" else np.mean(pooled))
+                rep_vals.append(rep_cutoff)
+                repeat_rows.append({
+                    "feature": feature,
+                    "repeat": rep + 1,
+                    "cutoff": rep_cutoff,
+                    "n_per_sample": int(n_draw),
+                    "n_samples": int(len(samples)),
+                    "level": level,
+                })
+            cutoff = float(np.median(rep_vals) if method == "balanced_global_median" else np.mean(rep_vals))
+        cutoff_values[feature] = cutoff
+
+    return CutoffResult(
+        cutoffs=pd.Series(cutoff_values, dtype=float, name="cutoff"),
+        sample_stats=pd.DataFrame(sample_rows),
+        replicate_cutoffs=pd.DataFrame(repeat_rows) if repeat_rows else None,
+        settings={
+            "level": level,
+            "method": method,
+            "sample_key": sample_key,
+            "samples": samples,
+            "grid_size": float(grid_size) if level == "grid" else None,
+            "agg": str(agg) if level == "grid" else None,
+            "min_cells_per_bin": int(min_cells_per_bin) if level == "grid" else None,
+            "n_repeats": int(n_repeats) if method.startswith("balanced_global_") else None,
+            "balance_round_to": int(balance_round_to) if method.startswith("balanced_global_") else None,
+            "balance_n": balance_n,
+            "balance_n_by_feature": balance_n_by_feature,
+            "random_state": int(random_state) if method.startswith("balanced_global_") else None,
+            "coord_cols": tuple(coord_cols),
+            "spatial_key": spatial_key,
+            "layer": layer,
+        },
+    )
+
+
+def calculate_global_cutoffs(*args, **kwargs) -> CutoffResult:
+    """Alias for :func:`calculate_cutoffs`."""
+    return calculate_cutoffs(*args, **kwargs)
+
+
+def _merge_calculated_cutoffs(
+    adata: AnnData,
+    features: Sequence[str],
+    cutoffs,
+    cutoff_method: str | None,
+    cutoff_level: str,
+    sample_key: str,
+    cutoff_samples: Sequence[str] | None,
+    coord_cols: Sequence[str],
+    spatial_key: str,
+    layer: str | None,
+    grid_size: float,
+    agg: str,
+    min_cells_per_bin: int,
+    cutoff_n_repeats: int,
+    cutoff_balance_round_to: int,
+    cutoff_balance_n: int | None,
+    cutoff_random_state: int,
+):
+    explicit = _coerce_cutoff_mapping(cutoffs)
+    if cutoff_method is None:
+        return explicit, None
+    needed = [str(f) for f in features if str(f) not in explicit]
+    if not needed:
+        return explicit, None
+    result = calculate_cutoffs(
+        adata,
+        features=needed,
+        sample_key=sample_key,
+        samples=cutoff_samples,
+        level=cutoff_level,
+        method=cutoff_method,
+        coord_cols=coord_cols,
+        spatial_key=spatial_key,
+        layer=layer,
+        grid_size=grid_size,
+        agg=agg,
+        min_cells_per_bin=min_cells_per_bin,
+        n_repeats=cutoff_n_repeats,
+        balance_round_to=cutoff_balance_round_to,
+        balance_n=cutoff_balance_n,
+        random_state=cutoff_random_state,
+    )
+    merged = result.cutoffs.to_dict()
+    merged.update(explicit)  # explicit values always override calculated values
+    return {str(k): float(v) for k, v in merged.items()}, result
+
+
+def positive_proportions(
+    adata: AnnData,
+    features: Sequence[str] | str,
+    sample_key: str = "sample_name",
+    samples: Sequence[str] | None = None,
+    level: str = "cell",
+    cutoff_method: str = "median_of_sample_medians",
+    cutoffs=None,
+    coord_cols: Sequence[str] = DEFAULT_COORD_COLS,
+    spatial_key: str = "spatial",
+    layer: str | None = None,
+    grid_size: float = 20.0,
+    agg: str = "mean",
+    min_cells_per_bin: int = 1,
+    cutoff_n_repeats: int = 100,
+    cutoff_balance_round_to: int = 1000,
+    cutoff_balance_n: int | None = None,
+    cutoff_random_state: int = 666,
+) -> pd.DataFrame:
+    """Summarize positive cell/grid proportions per sample using shared cutoffs."""
+    level = _normalize_cutoff_level(level)
+    features = [str(features)] if isinstance(features, str) else list(map(str, features))
+    samples = _resolve_cutoff_samples(adata, sample_key, samples)
+    resolved, _ = _merge_calculated_cutoffs(
+        adata, features, cutoffs, cutoff_method, level, sample_key, samples,
+        coord_cols, spatial_key, layer, grid_size, agg, min_cells_per_bin,
+        cutoff_n_repeats, cutoff_balance_round_to, cutoff_balance_n, cutoff_random_state,
+    )
+    sample_values_all = adata.obs[sample_key].astype(str).to_numpy()
+    rows = []
+    for sample in samples:
+        idx = np.flatnonzero(sample_values_all == sample)
+        coords = None
+        geometry = None
+        if level == "grid":
+            coords = _resolve_coords(adata, idx, coord_cols=coord_cols, spatial_key=spatial_key)
+            geometry = _make_grid(coords, grid_size, min_cells_per_bin)
+        for feature in features:
+            values = _resolve_feature_vector(adata, feature, idx, layer=layer)
+            if level == "cell":
+                vals = np.asarray(values, dtype=float)
+                finite = np.isfinite(vals)
+                unit_values = vals[finite]
+            else:
+                flat, counts, occupied, shape, _ = geometry
+                grid = _aggregate_grid(values, flat, counts, shape, agg=agg)
+                unit_values = grid[occupied & np.isfinite(grid)]
+            cutoff = float(resolved[feature])
+            n = int(unit_values.size)
+            n_pos = int(np.count_nonzero(unit_values > cutoff))
+            rows.append({
+                "sample": sample,
+                "feature": feature,
+                "level": level,
+                "cutoff": cutoff,
+                "n_units": n,
+                "n_positive": n_pos,
+                "positive_fraction": np.nan if n == 0 else n_pos / n,
+            })
+    return pd.DataFrame(rows)
+
+
 def _as_index_array(mask_or_index, n_obs: int) -> np.ndarray:
     if mask_or_index is None:
         return np.arange(n_obs, dtype=np.int64)
@@ -276,16 +655,16 @@ def spatial_adjust(
 def spatial_binstat(
     obj: SpatialAdjusted,
     bins: tuple[int, int] = (8, 8),
-    min_cutoff: float | None = 0.0,
+    min_cutoff=0.0,
     min_count: int = 10,
     pct_cutoff: float = 0.5,
     mask: np.ndarray | None = None,
 ) -> BinStatResult:
     """Bin a spatial feature and summarize the fraction above a cutoff.
 
-    This ports the calculation performed by the original package's non-exported
-    ``spatial_binstat`` helper. Matrix row order is top-to-bottom, matching the R
-    helper's visual matrix convention.
+    ``min_cutoff`` can be a numeric value, a mapping keyed by feature name, or a
+    :class:`CutoffResult`. ``None`` retains the legacy behavior of using the mean
+    of this object's finite feature values.
     """
     if obj.values is None:
         raise ValueError("SpatialAdjusted object must contain feature values.")
@@ -295,10 +674,13 @@ def spatial_binstat(
     values = np.asarray(obj.values, dtype=float)
     coords = np.asarray(obj.coords, dtype=float)
     if min_cutoff is None:
-        min_cutoff = float(np.nanmean(values))
+        resolved_cutoff = float(np.nanmean(values))
+    else:
+        resolved_cutoff = _resolve_feature_cutoff_input(min_cutoff, obj.feature)
+        if resolved_cutoff is None:
+            resolved_cutoff = float(np.nanmean(values))
     x_edges = np.linspace(coords[:, 0].min(), coords[:, 0].max(), nx + 1)
     y_edges = np.linspace(coords[:, 1].min(), coords[:, 1].max(), ny + 1)
-    # np.digitize gives lower-to-upper y; reverse row index to mirror the R matrix.
     xb = np.clip(np.digitize(coords[:, 0], x_edges[1:-1], right=False), 0, nx - 1)
     yb = np.clip(np.digitize(coords[:, 1], y_edges[1:-1], right=False), 0, ny - 1)
     row = ny - 1 - yb
@@ -310,7 +692,7 @@ def spatial_binstat(
             n = int(take.sum())
             stat_cnt[r, c] = n
             if n > int(min_count):
-                stat_pct[r, c] = float(np.mean(values[take] > float(min_cutoff)))
+                stat_pct[r, c] = float(np.mean(values[take] > float(resolved_cutoff)))
     if mask is None:
         stat_msk = (np.isfinite(stat_pct) & (stat_pct > float(pct_cutoff))).astype(int)
     else:
@@ -333,9 +715,10 @@ def spatial_binstat(
     return BinStatResult(
         stat_mtx_pct=stat_pct, stat_mtx_cnt=stat_cnt, stat_mtx_msk=stat_msk,
         stat_df=stat_df, stat_summary=stat_summary, x_edges=x_edges, y_edges=y_edges,
-        min_cutoff=float(min_cutoff), min_count=int(min_count), pct_cutoff=float(pct_cutoff),
+        min_cutoff=float(resolved_cutoff), min_count=int(min_count), pct_cutoff=float(pct_cutoff),
         feature=obj.feature,
     )
+
 
 
 def _make_grid(coords: np.ndarray, grid_size: float, min_cells_per_bin: int = 1):
@@ -402,13 +785,19 @@ def grid_feature_map(
     cutoff: float | None = None,
     quantile_cutoff: float | None = None,
     min_cells_per_bin: int = 1,
+    cutoff_method: str | None = None,
+    cutoff_samples: Sequence[str] | None = None,
+    cutoff_n_repeats: int = 100,
+    cutoff_balance_round_to: int = 1000,
+    cutoff_balance_n: int | None = None,
+    cutoff_random_state: int = 666,
 ) -> GridFeatureMap:
     """Rasterize one gene/signature to the same grid used by ``backend='grid'``.
 
-    The returned object is designed for direct spatial plotting with
-    :func:`sat4sc.pysphere_plotting.plot_grid_feature_map`. ``cutoff`` is optional and is
-    only used to mark high-feature bins in visualization; when omitted, the mean
-    across occupied finite bins is used, matching SPHERE's default threshold.
+    By default, ``cutoff`` is the mean of occupied finite grids in the displayed
+    sample, matching the legacy SPHERE-style behavior. Set ``cutoff_method`` to
+    one of the cohort-level methods returned by :func:`calculate_cutoffs` to use
+    one shared grid-level cutoff across samples.
     """
     if sample is None:
         idx = np.arange(adata.n_obs, dtype=np.int64)
@@ -428,11 +817,33 @@ def grid_feature_map(
     if vals.size == 0:
         chosen = np.nan
     elif quantile_cutoff is not None:
+        if cutoff_method is not None:
+            raise ValueError("quantile_cutoff and cutoff_method cannot be used together.")
         if not 0 <= float(quantile_cutoff) <= 1:
             raise ValueError("quantile_cutoff must be in [0, 1].")
         chosen = float(np.quantile(vals, float(quantile_cutoff)))
     elif cutoff is not None:
         chosen = float(cutoff)
+    elif cutoff_method is not None:
+        cr = calculate_cutoffs(
+            adata,
+            features=[feature],
+            sample_key=sample_key,
+            samples=cutoff_samples,
+            level="grid",
+            method=cutoff_method,
+            coord_cols=coord_cols,
+            spatial_key=spatial_key,
+            layer=layer,
+            grid_size=grid_size,
+            agg=agg,
+            min_cells_per_bin=min_cells_per_bin,
+            n_repeats=cutoff_n_repeats,
+            balance_round_to=cutoff_balance_round_to,
+            balance_n=cutoff_balance_n,
+            random_state=cutoff_random_state,
+        )
+        chosen = float(cr.cutoffs[feature])
     else:
         chosen = float(np.mean(vals))
     ny, nx = shape
@@ -451,11 +862,12 @@ def grid_feature_map(
         cutoff=chosen,
     )
 
+
 def _choose_cutoff(
     feature: str,
     grid: np.ndarray,
     occupied: np.ndarray,
-    cutoffs: Mapping[str, float] | None = None,
+    cutoffs=None,
     quantile_cutoffs: Mapping[str, float] | float | None = None,
 ) -> float:
     vals = grid[occupied & np.isfinite(grid)]
@@ -467,9 +879,11 @@ def _choose_cutoff(
             if not 0 <= float(q) <= 1:
                 raise ValueError("Quantile cutoffs must be in [0, 1].")
             return float(np.quantile(vals, float(q)))
-    if cutoffs is not None and feature in cutoffs:
-        return float(cutoffs[feature])
+    mapping = _coerce_cutoff_mapping(cutoffs)
+    if feature in mapping:
+        return float(mapping[feature])
     return float(np.mean(vals))
+
 
 
 def _aligned_slices(n: int, delta: int):
@@ -599,7 +1013,7 @@ def _cordstat_from_grids(
 def spatial_cordstat(
     obj1: SpatialAdjusted,
     obj2: SpatialAdjusted,
-    min_cutoffs: Sequence[float] | None = None,
+    min_cutoffs=None,
     min_pct_cutoffs: Sequence[float] | None = None,
     operator_steps: Sequence[int] = (4, 4, 4, 4),
     grid_size: float = 1.0,
@@ -609,8 +1023,9 @@ def spatial_cordstat(
 ) -> CordStatResult:
     """Compute displacement Jaccard statistics for two SpatialAdjusted objects.
 
-    This function mirrors SPHERE::spatial_cordstat conceptually. For continuous
-    coordinates, both objects are rasterized onto one regular grid.
+    ``min_cutoffs`` may be the legacy two-value sequence, a feature-keyed
+    mapping, or a :class:`CutoffResult`. This lets cohort-wide cutoffs calculated
+    with :func:`calculate_cutoffs` be reused in this lower-level API.
     """
     if obj1.values is None or obj2.values is None:
         raise ValueError("Both SpatialAdjusted objects must contain feature values.")
@@ -626,6 +1041,11 @@ def spatial_cordstat(
     if min_pct_cutoffs is not None:
         c1 = float(np.quantile(g1[occupied & np.isfinite(g1)], min_pct_cutoffs[0]))
         c2 = float(np.quantile(g2[occupied & np.isfinite(g2)], min_pct_cutoffs[1]))
+    elif isinstance(min_cutoffs, (CutoffResult, Mapping, pd.Series)):
+        mapping = _coerce_cutoff_mapping(min_cutoffs)
+        if obj1.feature not in mapping or obj2.feature not in mapping:
+            raise KeyError("min_cutoffs mapping/CutoffResult must contain both object feature names.")
+        c1, c2 = float(mapping[obj1.feature]), float(mapping[obj2.feature])
     elif min_cutoffs is not None:
         c1, c2 = map(float, min_cutoffs)
     else:
@@ -644,6 +1064,7 @@ def spatial_cordstat(
         cutoff_feature=c2,
         grid_size=float(grid_size),
     )
+
 
 
 def spatial_vec_proj(vectors: pd.DataFrame) -> pd.Series:
@@ -675,7 +1096,7 @@ def spatial_vec_magnitude(vectors: pd.DataFrame, features: Sequence[str] | None 
 def _choose_cutoff_values(
     feature: str,
     values: np.ndarray,
-    cutoffs: Mapping[str, float] | None = None,
+    cutoffs=None,
     quantile_cutoffs: Mapping[str, float] | float | None = None,
 ) -> float:
     vals = np.asarray(values, dtype=float)
@@ -688,9 +1109,11 @@ def _choose_cutoff_values(
             if not 0 <= float(q) <= 1:
                 raise ValueError("Quantile cutoffs must be in [0, 1].")
             return float(np.quantile(vals, float(q)))
-    if cutoffs is not None and feature in cutoffs:
-        return float(cutoffs[feature])
+    mapping = _coerce_cutoff_mapping(cutoffs)
+    if feature in mapping:
+        return float(mapping[feature])
     return float(np.mean(vals))
+
 
 
 def _normalize_backend_steps(backend: str, steps: Sequence[float] | None) -> tuple[float, ...]:
@@ -861,19 +1284,28 @@ def kdtree_domain_map(
     spatial_key: str = "spatial",
     layer: str | None = None,
     radius: float = 15.0,
-    cutoffs: Mapping[str, float] | None = None,
+    cutoffs=None,
     quantile_cutoffs: Mapping[str, float] | float | None = None,
+    cutoff_method: str | None = None,
+    cutoff_samples: Sequence[str] | None = None,
+    cutoff_n_repeats: int = 100,
+    cutoff_balance_round_to: int = 1000,
+    cutoff_balance_n: int | None = None,
+    cutoff_random_state: int = 666,
     shift: tuple[float, float] = (0.0, 0.0),
     workers: int = 1,
 ) -> KDTreeDomainResult:
     """Prepare target/feature radius domains for direct spatial visualization.
 
-    ``shift`` is in the original coordinate units (typically microns for Xenium)
-    and is applied virtually to ``feature`` before it is re-projected onto the
-    fixed cell anchors.
+    By default, KDTree positivity uses the legacy sample-specific mean. Set
+    ``cutoff_method`` to a cohort-wide method from :func:`calculate_cutoffs` to
+    use shared **cell-level** thresholds. Explicit values in ``cutoffs`` override
+    calculated cutoffs feature-by-feature.
     """
     if radius <= 0:
         raise ValueError("radius must be > 0.")
+    if cutoff_method is not None and quantile_cutoffs is not None:
+        raise ValueError("quantile_cutoffs and cutoff_method cannot be used together.")
     if sample is None:
         idx = np.arange(adata.n_obs, dtype=np.int64)
         sample_name = None
@@ -884,14 +1316,19 @@ def kdtree_domain_map(
         if idx.size == 0:
             raise ValueError(f"No observations found for {sample_key}={sample!r}.")
         sample_name = str(sample)
+    resolved_cutoffs, _ = _merge_calculated_cutoffs(
+        adata, [target, feature], cutoffs, cutoff_method, "cell", sample_key,
+        cutoff_samples, coord_cols, spatial_key, layer, 20.0, "mean", 1,
+        cutoff_n_repeats, cutoff_balance_round_to, cutoff_balance_n, cutoff_random_state,
+    )
     coords = _resolve_coords(adata, idx, coord_cols=coord_cols, spatial_key=spatial_key)
     target_values = _resolve_feature_vector(adata, target, idx, layer=layer)
     feature_values = _resolve_feature_vector(adata, feature, idx, layer=layer)
     ct, tpos, tcoords, ttree, tdomain = _kdtree_prepare_feature(
-        coords, target_values, target, radius, cutoffs, quantile_cutoffs, workers
+        coords, target_values, target, radius, resolved_cutoffs, quantile_cutoffs, workers
     )
     cf, fpos, fcoords, ftree, _ = _kdtree_prepare_feature(
-        coords, feature_values, feature, radius, cutoffs, quantile_cutoffs, workers
+        coords, feature_values, feature, radius, resolved_cutoffs, quantile_cutoffs, workers
     )
     anchor_tree = cKDTree(coords)
     fdomain = _domain_from_positive_tree(coords, ftree, radius, query_shift=shift, workers=workers)
@@ -913,6 +1350,7 @@ def kdtree_domain_map(
     )
 
 
+
 def _single_sample_vectors_grid(
     adata: AnnData,
     obs_idx: np.ndarray,
@@ -925,7 +1363,7 @@ def _single_sample_vectors_grid(
     layer: str | None,
     grid_size: float,
     agg: str,
-    cutoffs: Mapping[str, float] | None,
+    cutoffs,
     quantile_cutoffs: Mapping[str, float] | float | None,
     min_cells_per_bin: int,
     round_jaccard: int | None,
@@ -935,6 +1373,9 @@ def _single_sample_vectors_grid(
     target_values = _resolve_feature_vector(adata, target, obs_idx, layer=layer)
     target_grid = _aggregate_grid(target_values, flat, counts, shape, agg=agg)
     cutoff_target = _choose_cutoff(target, target_grid, occupied, cutoffs, quantile_cutoffs)
+    target_positive = occupied & np.isfinite(target_grid) & (target_grid > cutoff_target)
+    n_bins = int(occupied.sum())
+    n_positive_target = int(target_positive.sum())
     rows = []
     for feature in features:
         try:
@@ -945,6 +1386,8 @@ def _single_sample_vectors_grid(
             continue
         feature_grid = _aggregate_grid(feature_values, flat, counts, shape, agg=agg)
         cutoff_feature = _choose_cutoff(feature, feature_grid, occupied, cutoffs, quantile_cutoffs)
+        feature_positive = occupied & np.isfinite(feature_grid) & (feature_grid > cutoff_feature)
+        n_positive_feature = int(feature_positive.sum())
         for step in steps:
             stat = _cordstat_from_grids(
                 target_grid, feature_grid, occupied, cutoff_target, cutoff_feature,
@@ -962,11 +1405,16 @@ def _single_sample_vectors_grid(
                     "sample": sample_name,
                     "cutoff_target": cutoff_target,
                     "cutoff_feature": cutoff_feature,
-                    "n_bins": int(occupied.sum()),
+                    "n_bins": n_bins,
+                    "n_positive_target": n_positive_target,
+                    "n_positive_feature": n_positive_feature,
+                    "positive_fraction_target": np.nan if n_bins == 0 else n_positive_target / n_bins,
+                    "positive_fraction_feature": np.nan if n_bins == 0 else n_positive_feature / n_bins,
                     "backend": "grid",
                 }
             )
     return pd.DataFrame(rows)
+
 
 
 def _single_sample_vectors_kdtree(
@@ -980,7 +1428,7 @@ def _single_sample_vectors_kdtree(
     spatial_key: str,
     layer: str | None,
     radius: float,
-    cutoffs: Mapping[str, float] | None,
+    cutoffs,
     quantile_cutoffs: Mapping[str, float] | float | None,
     direction_mode: str,
     min_coverage: float,
@@ -990,9 +1438,11 @@ def _single_sample_vectors_kdtree(
     coords = _resolve_coords(adata, obs_idx, coord_cols=coord_cols, spatial_key=spatial_key)
     anchor_tree = cKDTree(coords)
     target_values = _resolve_feature_vector(adata, target, obs_idx, layer=layer)
-    cutoff_target, _, _, _, target_domain = _kdtree_prepare_feature(
+    cutoff_target, target_positive, _, _, target_domain = _kdtree_prepare_feature(
         coords, target_values, target, radius, cutoffs, quantile_cutoffs, workers
     )
+    n_anchors = int(coords.shape[0])
+    n_positive_target = int(np.count_nonzero(target_positive))
     rows = []
     for feature in features:
         try:
@@ -1004,6 +1454,7 @@ def _single_sample_vectors_kdtree(
         cutoff_feature, positive, positive_coords, feature_tree, feature_domain = _kdtree_prepare_feature(
             coords, feature_values, feature, radius, cutoffs, quantile_cutoffs, workers
         )
+        n_positive_feature = int(np.count_nonzero(positive))
         for step in steps:
             stat = _cordstat_from_kdtree(
                 coords=coords,
@@ -1032,14 +1483,18 @@ def _single_sample_vectors_kdtree(
                     "sample": sample_name,
                     "cutoff_target": cutoff_target,
                     "cutoff_feature": cutoff_feature,
-                    "n_anchors": int(coords.shape[0]),
-                    "n_positive_feature": int(np.count_nonzero(positive)),
+                    "n_anchors": n_anchors,
+                    "n_positive_target": n_positive_target,
+                    "n_positive_feature": n_positive_feature,
+                    "positive_fraction_target": np.nan if n_anchors == 0 else n_positive_target / n_anchors,
+                    "positive_fraction_feature": np.nan if n_anchors == 0 else n_positive_feature / n_anchors,
                     "min_direction_coverage": float(np.nanmin(cov)) if np.isfinite(cov).any() else np.nan,
                     "mean_direction_coverage": float(np.nanmean(cov)) if np.isfinite(cov).any() else np.nan,
                     "backend": "kdtree",
                 }
             )
     return pd.DataFrame(rows)
+
 
 
 def _single_sample_vectors(
@@ -1090,8 +1545,14 @@ def spatial_vector(
     backend: str = "grid",
     grid_size: float = 20.0,
     agg: str = "mean",
-    cutoffs: Mapping[str, float] | None = None,
+    cutoffs=None,
     quantile_cutoffs: Mapping[str, float] | float | None = None,
+    cutoff_method: str | None = None,
+    cutoff_samples: Sequence[str] | None = None,
+    cutoff_n_repeats: int = 100,
+    cutoff_balance_round_to: int = 1000,
+    cutoff_balance_n: int | None = None,
+    cutoff_random_state: int = 666,
     min_cells_per_bin: int = 1,
     radius: float = 15.0,
     direction_mode: str = "sphere",
@@ -1101,12 +1562,16 @@ def spatial_vector(
 ) -> SpatialVectorResult:
     """Generate SPHERE vectors for one tissue/sample with grid or KDTree backend.
 
-    Grid steps are measured in grid cells. KDTree steps are measured directly in
-    the coordinate units (normally microns for Xenium).
+    ``cutoff_method=None`` preserves the legacy sample-specific mean threshold.
+    Cohort-wide methods are calculated at grid level for ``backend='grid'`` and
+    at cell level for ``backend='kdtree'``. Explicit ``cutoffs`` override any
+    calculated feature cutoff.
     """
     backend = str(backend).lower()
     features = list(map(str, features))
     steps = _normalize_backend_steps(backend, steps)
+    if cutoff_method is not None and quantile_cutoffs is not None:
+        raise ValueError("quantile_cutoffs and cutoff_method cannot be used together.")
     if sample is None:
         idx = np.arange(adata.n_obs, dtype=np.int64)
         sample_name = "obj"
@@ -1117,9 +1582,16 @@ def spatial_vector(
         if idx.size == 0:
             raise ValueError(f"No observations found for {sample_key}={sample!r}.")
         sample_name = str(sample)
+    cutoff_level = "grid" if backend == "grid" else "cell"
+    resolved_cutoffs, cutoff_result = _merge_calculated_cutoffs(
+        adata, [target, *features], cutoffs, cutoff_method, cutoff_level,
+        sample_key, cutoff_samples, coord_cols, spatial_key, layer, grid_size,
+        agg, min_cells_per_bin, cutoff_n_repeats, cutoff_balance_round_to,
+        cutoff_balance_n, cutoff_random_state,
+    )
     vectors = _single_sample_vectors(
         adata, idx, sample_name, target, features, steps, coord_cols, spatial_key,
-        layer, backend, grid_size, agg, cutoffs, quantile_cutoffs,
+        layer, backend, grid_size, agg, resolved_cutoffs, quantile_cutoffs,
         min_cells_per_bin, radius, direction_mode, min_coverage, workers,
         round_jaccard,
     )
@@ -1150,8 +1622,17 @@ def spatial_vector(
             "spatial_key": spatial_key,
             "layer": layer,
             "round_jaccard": round_jaccard,
+            "cutoff_level": cutoff_level,
+            "cutoff_method": cutoff_method or "sample_mean_legacy",
+            "cutoffs": resolved_cutoffs,
+            "cutoff_samples": cutoff_result.settings.get("samples") if cutoff_result is not None else cutoff_samples,
+            "cutoff_n_repeats": cutoff_n_repeats if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
+            "cutoff_balance_round_to": cutoff_balance_round_to if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
+            "cutoff_balance_n": cutoff_balance_n,
+            "cutoff_random_state": cutoff_random_state if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
         },
     )
+
 
 
 def spatial_vector_x(
@@ -1167,8 +1648,14 @@ def spatial_vector_x(
     backend: str = "grid",
     grid_size: float = 20.0,
     agg: str = "mean",
-    cutoffs: Mapping[str, float] | None = None,
+    cutoffs=None,
     quantile_cutoffs: Mapping[str, float] | float | None = None,
+    cutoff_method: str | None = None,
+    cutoff_samples: Sequence[str] | None = None,
+    cutoff_n_repeats: int = 100,
+    cutoff_balance_round_to: int = 1000,
+    cutoff_balance_n: int | None = None,
+    cutoff_random_state: int = 666,
     min_cells_per_bin: int = 1,
     radius: float = 15.0,
     direction_mode: str = "sphere",
@@ -1177,9 +1664,17 @@ def spatial_vector_x(
     round_jaccard: int | None = 4,
     verbose: bool = True,
 ) -> SpatialVectorResult:
-    """Cohort-level SPHERE analysis using either regular-grid or KDTree backend."""
+    """Cohort-level SPHERE analysis using regular-grid or KDTree backend.
+
+    Use ``cutoff_method`` for one shared cutoff per feature across the cohort.
+    If ``cutoff_samples`` is omitted, the analyzed ``samples`` define the cutoff
+    cohort. Grid and KDTree automatically use grid-level and cell-level cutoff
+    calculation, respectively.
+    """
     backend = str(backend).lower()
     steps = _normalize_backend_steps(backend, steps)
+    if cutoff_method is not None and quantile_cutoffs is not None:
+        raise ValueError("quantile_cutoffs and cutoff_method cannot be used together.")
     if sample_key not in adata.obs.columns:
         raise KeyError(f"sample_key {sample_key!r} not found in adata.obs.")
     features = list(map(str, features))
@@ -1187,6 +1682,14 @@ def spatial_vector_x(
         samples = list(pd.unique(adata.obs[sample_key].astype(str)))
     else:
         samples = list(map(str, samples))
+    cutoff_cohort = list(map(str, cutoff_samples)) if cutoff_samples is not None else list(samples)
+    cutoff_level = "grid" if backend == "grid" else "cell"
+    resolved_cutoffs, cutoff_result = _merge_calculated_cutoffs(
+        adata, [target, *features], cutoffs, cutoff_method, cutoff_level,
+        sample_key, cutoff_cohort, coord_cols, spatial_key, layer, grid_size, agg,
+        min_cells_per_bin, cutoff_n_repeats, cutoff_balance_round_to,
+        cutoff_balance_n, cutoff_random_state,
+    )
     sample_values = adata.obs[sample_key].astype(str).to_numpy()
     raw_parts = []
     for i, sample in enumerate(samples, start=1):
@@ -1200,7 +1703,7 @@ def spatial_vector_x(
         raw_parts.append(
             _single_sample_vectors(
                 adata, idx, sample, target, features, steps, coord_cols, spatial_key,
-                layer, backend, grid_size, agg, cutoffs, quantile_cutoffs,
+                layer, backend, grid_size, agg, resolved_cutoffs, quantile_cutoffs,
                 min_cells_per_bin, radius, direction_mode, min_coverage, workers,
                 round_jaccard,
             )
@@ -1253,8 +1756,17 @@ def spatial_vector_x(
             "spatial_key": spatial_key,
             "layer": layer,
             "round_jaccard": round_jaccard,
+            "cutoff_level": cutoff_level,
+            "cutoff_method": cutoff_method or "sample_mean_legacy",
+            "cutoffs": resolved_cutoffs,
+            "cutoff_samples": cutoff_result.settings.get("samples") if cutoff_result is not None else cutoff_cohort,
+            "cutoff_n_repeats": cutoff_n_repeats if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
+            "cutoff_balance_round_to": cutoff_balance_round_to if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
+            "cutoff_balance_n": cutoff_balance_n,
+            "cutoff_random_state": cutoff_random_state if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
         },
     )
+
 
 
 def pairwise_projected_scores(
@@ -1269,8 +1781,14 @@ def pairwise_projected_scores(
     backend: str = "grid",
     grid_size: float = 20.0,
     agg: str = "mean",
-    cutoffs: Mapping[str, float] | None = None,
+    cutoffs=None,
     quantile_cutoffs: Mapping[str, float] | float | None = None,
+    cutoff_method: str | None = None,
+    cutoff_samples: Sequence[str] | None = None,
+    cutoff_n_repeats: int = 100,
+    cutoff_balance_round_to: int = 1000,
+    cutoff_balance_n: int | None = None,
+    cutoff_random_state: int = 666,
     min_cells_per_bin: int = 1,
     radius: float = 15.0,
     direction_mode: str = "sphere",
@@ -1281,12 +1799,15 @@ def pairwise_projected_scores(
 ) -> PairwiseResult:
     """Figure-3A-like pairwise projected-score matrix for either backend.
 
-    Only the final displacement is calculated. For KDTree, shifted feature
-    domains are cached once per feature/sample and reused across all targets.
+    ``cutoff_method`` applies the same cohort-wide cutoff for each feature to
+    every sample. Grid backend calculates those cutoffs on grid scores; KDTree
+    backend calculates them on cell/spot scores.
     """
     backend = str(backend).lower()
     if backend not in {"grid", "kdtree"}:
         raise ValueError("backend must be 'grid' or 'kdtree'.")
+    if cutoff_method is not None and quantile_cutoffs is not None:
+        raise ValueError("quantile_cutoffs and cutoff_method cannot be used together.")
     if final_step is None:
         final_step = float(DEFAULT_STEPS[-1] if backend == "grid" else DEFAULT_KDTREE_STEPS[-1])
     if backend == "grid" and not np.isclose(float(final_step), round(float(final_step))):
@@ -1298,6 +1819,14 @@ def pairwise_projected_scores(
         samples = list(pd.unique(adata.obs[sample_key].astype(str)))
     else:
         samples = list(map(str, samples))
+    cutoff_cohort = list(map(str, cutoff_samples)) if cutoff_samples is not None else list(samples)
+    cutoff_level = "grid" if backend == "grid" else "cell"
+    resolved_cutoffs, cutoff_result = _merge_calculated_cutoffs(
+        adata, features, cutoffs, cutoff_method, cutoff_level, sample_key,
+        cutoff_cohort, coord_cols, spatial_key, layer, grid_size, agg,
+        min_cells_per_bin, cutoff_n_repeats, cutoff_balance_round_to,
+        cutoff_balance_n, cutoff_random_state,
+    )
     sample_values = adata.obs[sample_key].astype(str).to_numpy()
     rows = []
     for i, sample in enumerate(samples, start=1):
@@ -1315,7 +1844,7 @@ def pairwise_projected_scores(
                 values = _resolve_feature_vector(adata, feature, idx, layer=layer)
                 grid = _aggregate_grid(values, flat, counts, shape, agg=agg)
                 grids[feature] = grid
-                thresholds[feature] = _choose_cutoff(feature, grid, occupied, cutoffs, quantile_cutoffs)
+                thresholds[feature] = _choose_cutoff(feature, grid, occupied, resolved_cutoffs, quantile_cutoffs)
             for target in features:
                 for feature in features:
                     if target == feature:
@@ -1335,7 +1864,7 @@ def pairwise_projected_scores(
             for feature in features:
                 values = _resolve_feature_vector(adata, feature, idx, layer=layer)
                 prepared[feature] = _kdtree_prepare_feature(
-                    coords, values, feature, radius, cutoffs, quantile_cutoffs, workers
+                    coords, values, feature, radius, resolved_cutoffs, quantile_cutoffs, workers
                 )
             shifted_cache = {}
             for feature in features:
@@ -1395,8 +1924,17 @@ def pairwise_projected_scores(
             "spatial_key": spatial_key,
             "layer": layer,
             "round_jaccard": round_jaccard,
+            "cutoff_level": cutoff_level,
+            "cutoff_method": cutoff_method or "sample_mean_legacy",
+            "cutoffs": resolved_cutoffs,
+            "cutoff_samples": cutoff_result.settings.get("samples") if cutoff_result is not None else cutoff_cohort,
+            "cutoff_n_repeats": cutoff_n_repeats if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
+            "cutoff_balance_round_to": cutoff_balance_round_to if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
+            "cutoff_balance_n": cutoff_balance_n,
+            "cutoff_random_state": cutoff_random_state if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
         },
     )
+
 
 
 def spatial_vector_kdtree(*args, **kwargs) -> SpatialVectorResult:
@@ -1498,8 +2036,13 @@ __all__ = [
     "PairwiseResult",
     "GridFeatureMap",
     "KDTreeDomainResult",
+    "CutoffResult",
+    "CUTOFF_METHODS",
     "spatial_adjust",
     "spatial_binstat",
+    "calculate_cutoffs",
+    "calculate_global_cutoffs",
+    "positive_proportions",
     "grid_feature_map",
     "kdtree_domain_map",
     "spatial_cordstat",

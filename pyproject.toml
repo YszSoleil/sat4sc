@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sat4sc"
+version = "0.2.2"
+description = "Spatial analysis tools for single-cell spatial transcriptomics, including a Python/AnnData SPHERE implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "GPL-2.0-or-later"}
+authors = [{name = "sat4sc developers"}]
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "scipy>=1.10",
+  "anndata>=0.10",
+  "matplotlib>=3.7"
+]
+
+[tool.setuptools]
+packages = ["sat4sc"]

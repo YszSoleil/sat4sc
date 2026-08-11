@@ -6,7 +6,7 @@
 from sat4sc import pysphere, pysphere_plotting
 ```
 
-当前版本：**v0.2.1**
+当前版本：**v0.2.2**
 
 ---
 
@@ -21,6 +21,82 @@ sat4sc/
     ├── __init__.py
     ├── pysphere.py      # 计算：grid/KDTree SPHERE、projected score、magnitude、pairwise matrix、module score
     └── pysphere_plotting.py      # 绘图：Figure 3A/3B/3F/4B、grid spatial map、KDTree domain map
+```
+
+---
+
+## v0.2.2 更新：cohort-wide cutoff system
+
+v0.2.2 新增统一的 cohort-level cutoff 计算，使不同样本的 `positive cell` / `positive grid` 使用同一把尺子，从而可以直接比较不同样本或样本组的 positive proportion。原 SPHERE-style 的 sample-specific mean 仍保留为默认行为，因此旧分析不会被改变。
+
+核心函数：
+
+```python
+cutoff_result = pysphere.calculate_cutoffs(
+    adata,
+    features=["Hypoxia_score", "Inflammation_score"],
+    sample_key="sample_name",
+    level="cell",   # 或 "grid"
+    method="balanced_global_median",
+)
+
+cutoff_result.cutoffs
+cutoff_result.sample_stats
+cutoff_result.replicate_cutoffs
+```
+
+支持四种 cohort-wide cutoff：
+
+```text
+median_of_sample_medians
+mean_of_sample_means
+balanced_global_median
+balanced_global_mean
+```
+
+其中 balanced 方法默认对每个样本随机抽取相同数量的单位：以最小样本的单位数为上限，并向下取整到 1000 的整数倍，例如 12,345 -> 12,000；默认重复 100 次。`level="cell"` 时单位是 cell/spot；`level="grid"` 时单位是 occupied finite grid。若最小样本少于 1000 个单位，则直接使用其实际单位数，避免向下取整为 0。
+
+这些 cutoff 已直接接入：
+
+```text
+grid_feature_map()
+kdtree_domain_map()
+spatial_vector()
+spatial_vector_x()
+pairwise_projected_scores()
+plot_binary_overlay()
+```
+
+并且低层接口 `spatial_binstat()`、`spatial_cordstat()`、`plot_spatial_overlap()` 可以直接接收 `CutoffResult` 或 feature-keyed cutoff mapping。
+
+例如让整个 cohort 的 grid-SPHERE 使用同一组 `balanced_global_median` cutoff：
+
+```python
+rs = pysphere.spatial_vector_x(
+    adata,
+    target="Hypoxia_score",
+    features=["Inflammation_score"],
+    backend="grid",
+    grid_size=20,
+    cutoff_method="balanced_global_median",
+    cutoff_n_repeats=100,
+    cutoff_balance_round_to=1000,
+    cutoff_random_state=666,
+)
+```
+
+直接得到每个样本的 positive proportion：
+
+```python
+positive_df = pysphere.positive_proportions(
+    adata,
+    features=["Hypoxia_score", "Inflammation_score"],
+    level="grid",
+    cutoff_method="balanced_global_median",
+    grid_size=20,
+)
+
+# sample | feature | cutoff | n_units | n_positive | positive_fraction
 ```
 
 ---
@@ -44,6 +120,18 @@ space="grid"
 ```
 
 用于绘制类似论文 Figure 3D / 3G 的两个 binary spatial objects 的空间叠加。
+3. 为减少旧代码迁移成本，包级别暂时保留：
+
+```python
+from sat4sc import plotting
+```
+
+作为 `pysphere_plotting` 的兼容别名；新代码建议统一使用：
+
+```python
+from sat4sc import pysphere, pysphere_plotting
+```
+
 ---
 
 ## 3. 三个 spatial plotting 函数的区别
@@ -185,7 +273,7 @@ fig, ax, info = pysphere_plotting.plot_binary_overlay(
 
 ### 3.5 `plot_binary_overlay()` 的 cutoff
 
-`cutoff1` / `cutoff2` 支持：
+`cutoff1` / `cutoff2` 继续支持 legacy/local cutoff：
 
 ```python
 "mean"                 # 默认；SPHERE-style
@@ -208,6 +296,22 @@ fig, ax, info = pysphere_plotting.plot_binary_overlay(
     cutoff2="zero",
 )
 ```
+
+从 v0.2.2 起，也可以直接使用 cohort-wide cutoff：
+
+```python
+fig, ax, info = pysphere_plotting.plot_binary_overlay(
+    adata,
+    feature1="Hypoxia_score",
+    feature2="MES1_score",
+    sample="sample01",
+    space="grid",
+    grid_size=20,
+    cutoff_method="balanced_global_median",
+)
+```
+
+详见第 16 节。
 
 ---
 
@@ -962,57 +1066,290 @@ stat
 
 # 16. cutoff 如何定义
 
-## Grid backend
+v0.2.2 将 cutoff 分成两类：**legacy sample-specific cutoff** 和 **cohort-wide shared cutoff**。
 
-默认在每个样本中，对 rasterized occupied grid 的 feature 值取均值：
+## 16.1 Legacy SPHERE-style cutoff
 
-```text
-positive grid = grid score > mean(grid score)
-```
+如果不指定 `cutoff_method`，行为与旧版本一致。
 
-## KDTree backend
-
-默认在每个样本中，对原始 cell-level feature 值取均值：
+Grid backend：
 
 ```text
-positive cell = cell score > mean(cell score)
+每个样本独立 rasterize
+positive grid = grid score > 该样本 occupied grids 的 mean(grid score)
 ```
 
-之后再通过 `radius` 扩展为 occupancy domain。
+KDTree backend：
 
----
+```text
+positive cell = cell score > 该样本所有 finite cells 的 mean(cell score)
+positive cells --radius expansion--> KDTree occupancy domain
+```
 
-## 16.1 手动 cutoff
+这种模式适合复现原 SPHERE-style 分析，但由于每个样本使用不同阈值，不建议直接把 positive proportion 用于样本组间比较。
+
+## 16.2 Cohort-wide cutoff：`calculate_cutoffs()`
+
+### median of sample-level median scores
 
 ```python
-rs = pysphere.spatial_vector_x(
+cr = pysphere.calculate_cutoffs(
+    adata,
+    features=["Hypoxia_score"],
+    level="cell",
+    method="median_of_sample_medians",
+)
+```
+
+定义：
+
+```text
+每个 sample -> median(score)
+所有 sample medians -> median
+```
+
+### mean of sample-level mean scores
+
+```python
+cr = pysphere.calculate_cutoffs(
+    adata,
+    features=["Hypoxia_score"],
+    level="cell",
+    method="mean_of_sample_means",
+)
+```
+
+定义：
+
+```text
+每个 sample -> mean(score)
+所有 sample means -> mean
+```
+
+这两种方法都让每个样本对最终 cutoff 贡献相同权重，不会让大样本因为 cell/grid 数量更多而主导阈值。
+
+### balanced global median / mean
+
+```python
+cr = pysphere.calculate_cutoffs(
+    adata,
+    features=["Hypoxia_score"],
+    level="cell",
+    method="balanced_global_median",  # 或 balanced_global_mean
+    n_repeats=100,
+    balance_round_to=1000,
+    random_state=666,
+)
+```
+
+默认算法：
+
+```text
+1. 对每个 feature 统计每个 sample 的 finite unit 数量
+2. 找到最小样本数量
+3. 向下取整到 1000 的整数倍
+   例如 12,345 -> 12,000
+4. 每个 sample 无放回随机抽取相同数量的单位
+5. 合并所有 sample 的抽样值
+6. 计算 pooled median 或 pooled mean
+7. 重复 100 次
+8. balanced_global_median -> 取 100 个 repeat median 的 median
+   balanced_global_mean   -> 取 100 个 repeat mean 的 mean
+```
+
+`level="cell"` 时抽样单位是 cell/spot；`level="grid"` 时抽样单位是每个样本独立 rasterize 后的 occupied finite grid。
+
+如果最小样本少于 1000 个单位，默认直接使用最小样本的实际单位数。也可以手动指定：
+
+```python
+balance_n=8000
+balance_round_to=500
+n_repeats=200
+```
+
+### Cell-level cutoff
+
+```python
+cell_cutoff = pysphere.calculate_cutoffs(
+    adata,
+    ["Hypoxia_score", "Inflammation_score"],
+    level="cell",
+    method="balanced_global_median",
+)
+```
+
+### Grid-level cutoff
+
+```python
+grid_cutoff = pysphere.calculate_cutoffs(
+    adata,
+    ["Hypoxia_score", "Inflammation_score"],
+    level="grid",
+    method="balanced_global_median",
+    grid_size=20,
+    agg="mean",
+)
+```
+
+Cell-level cutoff 与 grid-level cutoff 是不同的统计量，不应混用。Grid SPHERE 应使用 grid-level cutoff；KDTree SPHERE 应使用 cell-level cutoff。
+
+## 16.3 在 SPHERE 中直接调用 cohort cutoff
+
+Grid：
+
+```python
+rs_grid = pysphere.spatial_vector_x(
+    adata,
+    target="Hypoxia_score",
+    features=["Inflammation_score"],
+    backend="grid",
+    grid_size=20,
+    cutoff_method="balanced_global_median",
+)
+```
+
+KDTree：
+
+```python
+rs_kd = pysphere.spatial_vector_x(
     adata,
     target="Hypoxia_score",
     features=["Inflammation_score"],
     backend="kdtree",
-    cutoffs={
-        "Hypoxia_score": 0.12,
-        "Inflammation_score": 0.08,
-    },
+    radius=15,
+    cutoff_method="balanced_global_median",
 )
 ```
 
-## 16.2 quantile cutoff
+`sat4sc` 会自动选择 cutoff 计算层级：
 
-统一分位数：
+```text
+backend="grid"   -> level="grid"
+backend="kdtree" -> level="cell"
+```
+
+结果的：
+
+```python
+rs_grid.settings["cutoff_method"]
+rs_grid.settings["cutoffs"]
+rs_grid.pool_raw[
+    ["sample", "cutoff_target", "cutoff_feature",
+     "positive_fraction_target", "positive_fraction_feature"]
+]
+```
+
+可以直接检查所有样本是否使用了同一 cutoff，并查看每个样本的 positive proportion。
+
+同样的 `cutoff_method=` 参数也可直接用于：
+
+```python
+grid_feature_map()
+kdtree_domain_map()
+pairwise_projected_scores()
+```
+
+## 16.4 比较每个样本的 positive proportion
+
+```python
+positive_grid = pysphere.positive_proportions(
+    adata,
+    features=["Hypoxia_score"],
+    level="grid",
+    cutoff_method="balanced_global_median",
+    grid_size=20,
+)
+```
+
+输出包括：
+
+```text
+sample
+feature
+level
+cutoff
+n_units
+n_positive
+positive_fraction
+```
+
+建议后续以 **sample 为统计单位** 比较不同 `sample_group` 的 `positive_fraction`，而不是把所有 cell/grid 当作独立生物学重复。
+
+## 16.5 `plot_binary_overlay()` 使用 cohort cutoff
+
+Cell-level：
+
+```python
+fig, ax, info = pysphere_plotting.plot_binary_overlay(
+    adata,
+    feature1="Hypoxia_score",
+    feature2="Inflammation_score",
+    sample="sample01",
+    space="cell",
+    cutoff_method="balanced_global_median",
+)
+```
+
+Grid-level：
+
+```python
+fig, ax, info = pysphere_plotting.plot_binary_overlay(
+    adata,
+    feature1="Hypoxia_score",
+    feature2="Inflammation_score",
+    sample="sample01",
+    space="grid",
+    grid_size=20,
+    cutoff_method="balanced_global_median",
+)
+```
+
+也可以先计算一次 cutoff，然后反复复用，避免重复随机抽样：
+
+```python
+cr = pysphere.calculate_cutoffs(
+    adata,
+    ["Hypoxia_score", "Inflammation_score"],
+    level="cell",
+    method="balanced_global_median",
+)
+
+fig, ax, info = pysphere_plotting.plot_binary_overlay(
+    adata,
+    "Hypoxia_score",
+    "Inflammation_score",
+    sample="sample01",
+    space="cell",
+    cohort_cutoffs=cr,
+)
+```
+
+低层接口也可以直接复用：
+
+```python
+pysphere_plotting.plot_spatial_overlap(obj1, obj2, cutoffs=cr)
+pysphere.spatial_binstat(obj1, min_cutoff=cr)
+pysphere.spatial_cordstat(obj1, obj2, min_cutoffs=cr)
+```
+
+## 16.6 手动 cutoff 与 quantile cutoff
+
+旧接口继续支持：
+
+```python
+cutoffs={
+    "Hypoxia_score": 0.12,
+    "Inflammation_score": 0.08,
+}
+```
+
+或 sample-specific quantile：
 
 ```python
 quantile_cutoffs=0.75
 ```
 
-或不同 feature：
-
-```python
-quantile_cutoffs={
-    "Hypoxia_score": 0.75,
-    "Inflammation_score": 0.80,
-}
-```
+如果同时提供 `cutoff_method` 与 `cutoffs`，显式 `cutoffs` 会按 feature 覆盖计算得到的 cohort cutoff。`cutoff_method` 与 `quantile_cutoffs` 不允许同时使用，以避免阈值语义冲突。
 
 ---
 
