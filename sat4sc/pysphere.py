@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.spatial import cKDTree
+from scipy.ndimage import label as ndi_label
 
 try:
     from anndata import AnnData
@@ -177,6 +178,50 @@ class CutoffResult:
     sample_stats: pd.DataFrame
     replicate_cutoffs: pd.DataFrame | None
     settings: dict = field(default_factory=dict)
+
+
+@dataclass
+class NicheSampleResult:
+    """Per-sample grid-domain representation of a spatial niche.
+
+    A niche is defined as a connected component of positive grids with at least
+    ``min_connected_grids`` members. Cell-level membership is inherited from the
+    grid containing each cell/spot.
+    """
+
+    sample: str
+    coords: np.ndarray
+    cell_indices: np.ndarray
+    grid: np.ndarray
+    occupied: np.ndarray
+    positive_grid: np.ndarray
+    niche_grid: np.ndarray
+    component_labels: np.ndarray
+    counts: np.ndarray
+    x_edges: np.ndarray
+    y_edges: np.ndarray
+    cell_positive_grid: np.ndarray
+    cell_niche: np.ndarray
+    cell_component: np.ndarray
+    component_sizes: dict[int, int]
+
+
+@dataclass
+class NicheResult:
+    """Cohort-aware spatial niche result for one feature/signature.
+
+    ``positive_grid`` is determined by the selected cutoff strategy. A grid is
+    promoted from positive to niche only when it belongs to a spatially
+    connected component containing at least ``min_connected_grids`` positive
+    grids.
+    """
+
+    feature: str
+    cutoff: float
+    sample_results: dict[str, NicheSampleResult]
+    summary: pd.DataFrame
+    settings: dict = field(default_factory=dict)
+    cutoff_result: CutoffResult | None = None
 
 
 def _normalize_cutoff_level(level: str) -> str:
@@ -421,6 +466,312 @@ def calculate_cutoffs(
 def calculate_global_cutoffs(*args, **kwargs) -> CutoffResult:
     """Alias for :func:`calculate_cutoffs`."""
     return calculate_cutoffs(*args, **kwargs)
+
+
+def _connected_component_structure(connectivity: int) -> np.ndarray:
+    """Return a 2-D 4- or 8-neighbor connectivity structure."""
+    connectivity = int(connectivity)
+    if connectivity == 4:
+        return np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.int8)
+    if connectivity == 8:
+        return np.ones((3, 3), dtype=np.int8)
+    raise ValueError("connectivity must be 4 or 8.")
+
+
+def _filter_positive_components(
+    positive_grid: np.ndarray,
+    min_connected_grids: int,
+    connectivity: int,
+):
+    """Convert positive grids into retained niche components.
+
+    Returns
+    -------
+    niche_grid
+        Boolean mask containing only retained components.
+    component_labels
+        Integer labels for retained components; 0 denotes non-niche grids.
+    component_sizes
+        Mapping from retained component id to number of grids.
+    raw_component_sizes
+        Mapping for all positive components before minimum-size filtering.
+    """
+    min_connected_grids = int(min_connected_grids)
+    if min_connected_grids < 1:
+        raise ValueError("min_connected_grids must be >= 1.")
+    positive_grid = np.asarray(positive_grid, dtype=bool)
+    labels_raw, n_raw = ndi_label(positive_grid, structure=_connected_component_structure(connectivity))
+    raw_sizes = {}
+    kept_old_ids = []
+    for old_id in range(1, int(n_raw) + 1):
+        size = int(np.sum(labels_raw == old_id))
+        raw_sizes[old_id] = size
+        if size >= min_connected_grids:
+            kept_old_ids.append(old_id)
+    niche_grid = np.isin(labels_raw, kept_old_ids)
+    component_labels = np.zeros_like(labels_raw, dtype=np.int32)
+    component_sizes = {}
+    for new_id, old_id in enumerate(kept_old_ids, start=1):
+        mask = labels_raw == old_id
+        component_labels[mask] = new_id
+        component_sizes[new_id] = int(mask.sum())
+    return niche_grid, component_labels, component_sizes, raw_sizes
+
+
+def define_niche(
+    adata: AnnData,
+    feature: str,
+    sample_key: str = "sample_name",
+    samples: Sequence[str] | None = None,
+    coord_cols: Sequence[str] = DEFAULT_COORD_COLS,
+    spatial_key: str = "spatial",
+    layer: str | None = None,
+    grid_size: float = 20.0,
+    agg: str = "mean",
+    min_cells_per_bin: int = 1,
+    cutoff: float | None = None,
+    cutoff_method: str | None = "balanced_global_mean",
+    cohort_cutoffs=None,
+    cutoff_samples: Sequence[str] | None = None,
+    cutoff_n_repeats: int = 100,
+    cutoff_balance_round_to: int = 1000,
+    cutoff_balance_n: int | None = None,
+    cutoff_random_state: int = 666,
+    min_connected_grids: int = 3,
+    connectivity: int = 8,
+    annotate_obs: bool = False,
+    obs_prefix: str | None = None,
+) -> NicheResult:
+    """Define a spatial niche as ``positive grid + spatial continuity``.
+
+    The feature is rasterized independently within each sample using the same
+    regular-grid geometry as ``backend='grid'``. Grids with score greater than
+    the selected cutoff are called positive. Positive grids are then labeled by
+    4- or 8-neighbor connected components, and only components containing at
+    least ``min_connected_grids`` grids are retained as niches.
+
+    By default, the cutoff is ``balanced_global_mean`` calculated at grid level,
+    so every sample is evaluated using the same cohort-wide threshold while
+    samples contribute equally to threshold estimation. Pass ``cutoff`` for an
+    explicit threshold, or ``cohort_cutoffs`` to reuse a precomputed mapping or
+    :class:`CutoffResult`.
+
+    Cell/spot niche membership is inherited from the retained niche grid that
+    contains each cell/spot. When ``annotate_obs=True``, three columns are added:
+    ``<prefix>_positive_grid``, ``<prefix>_niche`` and ``<prefix>_niche_id``.
+    """
+    feature = str(feature)
+    samples_resolved = _resolve_cutoff_samples(adata, sample_key, samples)
+    cutoff_cohort = list(map(str, cutoff_samples)) if cutoff_samples is not None else list(samples_resolved)
+    cutoff_result = None
+    mapping = _coerce_cutoff_mapping(cohort_cutoffs)
+    if cutoff is not None:
+        chosen_cutoff = float(cutoff)
+    elif feature in mapping:
+        chosen_cutoff = float(mapping[feature])
+    elif cutoff_method is not None:
+        cutoff_result = calculate_cutoffs(
+            adata,
+            features=[feature],
+            sample_key=sample_key,
+            samples=cutoff_cohort,
+            level="grid",
+            method=cutoff_method,
+            coord_cols=coord_cols,
+            spatial_key=spatial_key,
+            layer=layer,
+            grid_size=grid_size,
+            agg=agg,
+            min_cells_per_bin=min_cells_per_bin,
+            n_repeats=cutoff_n_repeats,
+            balance_round_to=cutoff_balance_round_to,
+            balance_n=cutoff_balance_n,
+            random_state=cutoff_random_state,
+        )
+        chosen_cutoff = float(cutoff_result.cutoffs[feature])
+    else:
+        raise ValueError(
+            "A shared niche cutoff is required. Provide cutoff, cohort_cutoffs, "
+            "or cutoff_method."
+        )
+    if not np.isfinite(chosen_cutoff):
+        raise ValueError(f"Resolved cutoff for {feature!r} is not finite.")
+
+    sample_values_all = adata.obs[sample_key].astype(str).to_numpy()
+    sample_results = {}
+    summary_rows = []
+    obs_positive = np.zeros(int(adata.n_obs), dtype=bool)
+    obs_niche = np.zeros(int(adata.n_obs), dtype=bool)
+    obs_component = np.zeros(int(adata.n_obs), dtype=np.int32)
+
+    for sample in samples_resolved:
+        idx = np.flatnonzero(sample_values_all == str(sample))
+        coords = _resolve_coords(adata, idx, coord_cols=coord_cols, spatial_key=spatial_key)
+        values = _resolve_feature_vector(adata, feature, idx, layer=layer)
+        flat, counts_flat, occupied, shape, xy_min = _make_grid(coords, grid_size, min_cells_per_bin)
+        grid = _aggregate_grid(values, flat, counts_flat, shape, agg=agg)
+        positive_grid = occupied & np.isfinite(grid) & (grid > chosen_cutoff)
+        niche_grid, component_labels, component_sizes, raw_component_sizes = _filter_positive_components(
+            positive_grid,
+            min_connected_grids=min_connected_grids,
+            connectivity=connectivity,
+        )
+        ny, nx = shape
+        x_edges = xy_min[0] + np.arange(nx + 1, dtype=float) * float(grid_size)
+        y_edges = xy_min[1] + np.arange(ny + 1, dtype=float) * float(grid_size)
+        positive_flat = positive_grid.ravel()
+        niche_flat = niche_grid.ravel()
+        component_flat = component_labels.ravel()
+        cell_positive_grid = positive_flat[flat]
+        cell_niche = niche_flat[flat]
+        cell_component = component_flat[flat].astype(np.int32, copy=False)
+        obs_positive[idx] = cell_positive_grid
+        obs_niche[idx] = cell_niche
+        obs_component[idx] = cell_component
+        n_occupied = int(occupied.sum())
+        n_positive = int(positive_grid.sum())
+        n_niche_grid = int(niche_grid.sum())
+        n_niches = int(len(component_sizes))
+        largest_niche = int(max(component_sizes.values())) if component_sizes else 0
+        n_cells = int(len(idx))
+        n_positive_cells = int(cell_positive_grid.sum())
+        n_niche_cells = int(cell_niche.sum())
+        sample_results[str(sample)] = NicheSampleResult(
+            sample=str(sample),
+            coords=np.asarray(coords, dtype=float),
+            cell_indices=idx.astype(np.int64, copy=False),
+            grid=np.asarray(grid, dtype=float),
+            occupied=np.asarray(occupied, dtype=bool),
+            positive_grid=np.asarray(positive_grid, dtype=bool),
+            niche_grid=np.asarray(niche_grid, dtype=bool),
+            component_labels=np.asarray(component_labels, dtype=np.int32),
+            counts=np.asarray(counts_flat, dtype=np.int32).reshape(shape),
+            x_edges=np.asarray(x_edges, dtype=float),
+            y_edges=np.asarray(y_edges, dtype=float),
+            cell_positive_grid=np.asarray(cell_positive_grid, dtype=bool),
+            cell_niche=np.asarray(cell_niche, dtype=bool),
+            cell_component=np.asarray(cell_component, dtype=np.int32),
+            component_sizes=component_sizes,
+        )
+        summary_rows.append({
+            "sample": str(sample),
+            "feature": feature,
+            "cutoff": chosen_cutoff,
+            "n_occupied_grids": n_occupied,
+            "n_positive_grids": n_positive,
+            "positive_grid_fraction": np.nan if n_occupied == 0 else n_positive / n_occupied,
+            "n_niche_grids": n_niche_grid,
+            "niche_grid_fraction": np.nan if n_occupied == 0 else n_niche_grid / n_occupied,
+            "n_positive_components": int(len(raw_component_sizes)),
+            "n_niches": n_niches,
+            "largest_niche_grids": largest_niche,
+            "n_cells": n_cells,
+            "n_cells_in_positive_grid": n_positive_cells,
+            "positive_grid_cell_fraction": np.nan if n_cells == 0 else n_positive_cells / n_cells,
+            "n_niche_cells": n_niche_cells,
+            "niche_cell_fraction": np.nan if n_cells == 0 else n_niche_cells / n_cells,
+            "niche_area": float(n_niche_grid * float(grid_size) ** 2),
+        })
+
+    prefix = obs_prefix
+    if prefix is None:
+        prefix = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in feature).strip("_") or "feature"
+    if annotate_obs:
+        # Samples excluded by ``samples`` remain False/0, making the scope explicit.
+        adata.obs[f"{prefix}_positive_grid"] = obs_positive
+        adata.obs[f"{prefix}_niche"] = obs_niche
+        adata.obs[f"{prefix}_niche_id"] = obs_component
+
+    return NicheResult(
+        feature=feature,
+        cutoff=chosen_cutoff,
+        sample_results=sample_results,
+        summary=pd.DataFrame(summary_rows),
+        settings={
+            "definition": "positive_grid_plus_connected_component",
+            "sample_key": sample_key,
+            "samples": list(samples_resolved),
+            "coord_cols": tuple(coord_cols),
+            "spatial_key": spatial_key,
+            "layer": layer,
+            "grid_size": float(grid_size),
+            "agg": str(agg),
+            "min_cells_per_bin": int(min_cells_per_bin),
+            "cutoff_method": cutoff_method if cutoff is None and feature not in mapping else "precomputed_or_manual",
+            "cutoff_samples": cutoff_cohort,
+            "cutoff_n_repeats": int(cutoff_n_repeats),
+            "cutoff_balance_round_to": int(cutoff_balance_round_to),
+            "cutoff_balance_n": cutoff_balance_n,
+            "cutoff_random_state": int(cutoff_random_state),
+            "min_connected_grids": int(min_connected_grids),
+            "connectivity": int(connectivity),
+            "annotate_obs": bool(annotate_obs),
+            "obs_prefix": prefix if annotate_obs else None,
+        },
+        cutoff_result=cutoff_result,
+    )
+
+
+def define_niches(
+    adata: AnnData,
+    features: Sequence[str],
+    **kwargs,
+) -> dict[str, NicheResult]:
+    """Define multiple grid-based niches using one shared cutoff calculation.
+
+    This is a convenience wrapper around :func:`define_niche`. When no explicit
+    ``cutoff``/``cohort_cutoffs`` are supplied, cohort-wide grid cutoffs for all
+    requested features are calculated once and reused.
+    """
+    features = list(map(str, features))
+    if not features:
+        raise ValueError("features must contain at least one feature.")
+    if "cutoff" in kwargs and kwargs["cutoff"] is not None:
+        raise ValueError("define_niches() does not accept one scalar cutoff for multiple features; use cohort_cutoffs.")
+    cohort_cutoffs = kwargs.pop("cohort_cutoffs", None)
+    cutoff_method = kwargs.get("cutoff_method", "balanced_global_mean")
+    mapping = _coerce_cutoff_mapping(cohort_cutoffs)
+    missing = [f for f in features if f not in mapping]
+    shared_cutoff_result = None
+    if missing and cutoff_method is not None:
+        sample_key = kwargs.get("sample_key", "sample_name")
+        samples = kwargs.get("samples", None)
+        cutoff_samples = kwargs.get("cutoff_samples", None)
+        samples_resolved = _resolve_cutoff_samples(adata, sample_key, samples)
+        cutoff_cohort = list(map(str, cutoff_samples)) if cutoff_samples is not None else list(samples_resolved)
+        shared_cutoff_result = calculate_cutoffs(
+            adata,
+            features=missing,
+            sample_key=sample_key,
+            samples=cutoff_cohort,
+            level="grid",
+            method=cutoff_method,
+            coord_cols=kwargs.get("coord_cols", DEFAULT_COORD_COLS),
+            spatial_key=kwargs.get("spatial_key", "spatial"),
+            layer=kwargs.get("layer", None),
+            grid_size=kwargs.get("grid_size", 20.0),
+            agg=kwargs.get("agg", "mean"),
+            min_cells_per_bin=kwargs.get("min_cells_per_bin", 1),
+            n_repeats=kwargs.get("cutoff_n_repeats", 100),
+            balance_round_to=kwargs.get("cutoff_balance_round_to", 1000),
+            balance_n=kwargs.get("cutoff_balance_n", None),
+            random_state=kwargs.get("cutoff_random_state", 666),
+        )
+        mapping.update(shared_cutoff_result.cutoffs.to_dict())
+    if missing and cutoff_method is None:
+        raise ValueError("Missing cutoffs for one or more features and cutoff_method=None.")
+
+    out = {}
+    for feature in features:
+        one_kwargs = dict(kwargs)
+        one_kwargs["cutoff_method"] = None
+        one_kwargs["cohort_cutoffs"] = mapping
+        result = define_niche(adata, feature=feature, **one_kwargs)
+        if shared_cutoff_result is not None and feature in shared_cutoff_result.cutoffs.index:
+            result.cutoff_result = shared_cutoff_result
+            result.settings["cutoff_method"] = cutoff_method
+        out[feature] = result
+    return out
 
 
 def _merge_calculated_cutoffs(
@@ -2037,12 +2388,16 @@ __all__ = [
     "GridFeatureMap",
     "KDTreeDomainResult",
     "CutoffResult",
+    "NicheSampleResult",
+    "NicheResult",
     "CUTOFF_METHODS",
     "spatial_adjust",
     "spatial_binstat",
     "calculate_cutoffs",
     "calculate_global_cutoffs",
     "positive_proportions",
+    "define_niche",
+    "define_niches",
     "grid_feature_map",
     "kdtree_domain_map",
     "spatial_cordstat",

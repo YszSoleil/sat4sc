@@ -6,7 +6,7 @@
 from sat4sc import pysphere, pysphere_plotting
 ```
 
-当前版本：**v0.2.2**
+当前版本：**v0.3.0**
 
 ---
 
@@ -17,10 +17,307 @@ sat4sc/
 ├── pyproject.toml
 ├── README.md
 ├── NOTICE.md
+├── LICENSE
 └── sat4sc/
     ├── __init__.py
-    ├── pysphere.py      # 计算：grid/KDTree SPHERE、projected score、magnitude、pairwise matrix、module score
-    └── pysphere_plotting.py      # 绘图：Figure 3A/3B/3F/4B、grid spatial map、KDTree domain map
+    ├── pysphere.py      # 计算：grid/KDTree SPHERE、cohort cutoff、positive grid、spatial niche、module score
+    └── pysphere_plotting.py      # 绘图：SPHERE figures、binary overlay、niche overlay、niche + continuous feature
+```
+
+---
+
+## v0.3.0 更新：positive grid + spatial continuity = niche
+
+v0.3.0 在 v0.2.2 的 cohort-wide cutoff 系统上增加了正式的 spatial niche 定义。核心概念是把 **feature-positive grid** 和 **spatially continuous domain** 分开：
+
+```text
+continuous feature score
+        ↓
+shared grid-level cutoff
+        ↓
+positive grids
+        ↓
+4/8-neighbor connected components
+        ↓
+component size >= min_connected_grids
+        ↓
+spatial niche
+```
+
+因此：
+
+```text
+positive grid ≠ niche
+```
+
+只有属于足够大的连续 positive-grid component 的 grid 才被标记为 niche。默认参数为：
+
+```python
+cutoff_method="balanced_global_mean"
+min_connected_grids=3
+connectivity=8
+```
+
+
+
+当 `connectivity=8` 时，只要另一个positive grid位于它的：
+
+- 上、下、左、右
+- 左上、右上、左下、右下
+
+任意一个方向，就认为两者是相邻、连通的。
+
+
+
+当connectivity=4，连通只认可——上、下、左、右
+
+### 0.3.1 定义一个 niche
+
+```python
+hypoxia_niche = pysphere.define_niche(
+    adata,
+    feature="Hypoxia_score",
+    sample_key="sample_name",
+    grid_size=20,
+    agg="mean",
+    cutoff_method="balanced_global_mean",
+    cutoff_n_repeats=100,
+    cutoff_balance_round_to=1000,
+    cutoff_random_state=666,
+    min_connected_grids=3,
+    connectivity=8,
+    annotate_obs=True,
+    obs_prefix="hypoxia",
+)
+```
+
+`hypoxia_niche.summary` 返回每个样本的：
+
+```text
+sample
+feature
+cutoff
+n_occupied_grids
+n_positive_grids
+positive_grid_fraction
+n_niche_grids
+niche_grid_fraction
+n_positive_components
+n_niches
+largest_niche_grids
+n_cells
+n_cells_in_positive_grid
+positive_grid_cell_fraction
+n_niche_cells
+niche_cell_fraction
+niche_area
+```
+
+当 `annotate_obs=True` 时，会直接向 `adata.obs` 写入：
+
+```python
+adata.obs["hypoxia_positive_grid"]
+adata.obs["hypoxia_niche"]
+adata.obs["hypoxia_niche_id"]
+```
+
+这里 cell-level niche membership 的定义是：**该 cell 所在的 grid 是否属于 retained niche component**。因此 niche 的定义始终发生在 grid level，而 cell level 是从 grid membership 映射回真实 cell/spot。
+
+### 0.3.2 一次定义多个 niche
+
+推荐对需要直接比较的多个 pathway 一次计算共享 cohort cutoffs：
+
+```python
+niches = pysphere.define_niches(
+    adata,
+    features=["Hypoxia_score", "Inflammation_score"],
+    sample_key="sample_name",
+    grid_size=20,
+    cutoff_method="balanced_global_mean",
+    min_connected_grids=3,
+    connectivity=8,
+)
+
+hypoxia_niche = niches["Hypoxia_score"]
+inflammation_niche = niches["Inflammation_score"]
+```
+
+### 0.3.3 可视化 I：niche + niche
+
+四种状态使用不同颜色：
+
+```text
+Other
+Niche 1 only
+Niche 2 only
+Overlap
+```
+
+Grid-level：
+
+```python
+fig, ax, info = pysphere_plotting.plot_niche_overlay(
+    hypoxia_niche,
+    inflammation_niche,
+    sample="sample01",
+    space="grid",
+)
+```
+
+Cell-level：
+
+```python
+fig, ax, info = pysphere_plotting.plot_niche_overlay(
+    hypoxia_niche,
+    inflammation_niche,
+    sample="sample01",
+    space="cell",
+    point_size=3,
+)
+```
+
+### 0.3.4 可视化 II：niche + another feature positive
+
+例如查看 Hypoxia niche 与 LDHA-positive 的空间关系。Grid-level 时 LDHA positivity 基于 grid-level cutoff；cell-level 时基于 cell-level cutoff：
+
+```python
+fig, ax, info = pysphere_plotting.plot_niche_positive_overlay(
+    hypoxia_niche,
+    adata,
+    feature="LDHA",
+    sample="sample01",
+    space="grid",
+    cutoff_method="balanced_global_mean",
+)
+```
+
+```python
+fig, ax, info = pysphere_plotting.plot_niche_positive_overlay(
+    hypoxia_niche,
+    adata,
+    feature="LDHA",
+    sample="sample01",
+    space="cell",
+    cutoff_method="balanced_global_mean",
+    point_size=3,
+)
+```
+
+输出同样分成：
+
+```text
+Other
+Niche only
+Feature-positive only
+Overlap
+```
+
+可以通过 `cohort_cutoffs=` 直接复用 `calculate_cutoffs()` 产生的 `CutoffResult`，避免重复执行 balanced sampling。
+
+### 0.3.5 可视化 III：niche + continuous feature
+
+对于连续表达量/通路分数，不再额外二值化。
+
+Cell-level 默认编码方式：
+
+```text
+face color = continuous feature value
+black edge = cell resides in niche
+```
+
+```python
+fig, ax, info = pysphere_plotting.plot_niche_continuous_feature(
+    hypoxia_niche,
+    adata,
+    feature="LDHA",
+    sample="sample01",
+    space="cell",
+    cmap="viridis",
+    point_size=3,
+    niche_edge_color="black",
+)
+```
+
+Grid-level 默认编码方式：
+
+```text
+grid fill color = continuous grid-level feature value
+black outer boundary = retained niche domain
+```
+
+```python
+fig, ax, info = pysphere_plotting.plot_niche_continuous_feature(
+    hypoxia_niche,
+    adata,
+    feature="LDHA",
+    sample="sample01",
+    space="grid",
+    cmap="viridis",
+)
+```
+
+连续颜色默认使用样本内 finite values 的 1st–99th percentile 作为显示范围，避免少数极端值压缩色阶；这只影响可视化，不影响真实数值或 niche 定义。若希望显示完整范围：
+
+```python
+color_quantiles=None
+```
+
+也可以手动指定：
+
+```python
+vmin=0
+vmax=2
+```
+
+### 0.3.6 4-neighbor vs 8-neighbor
+
+默认：
+
+```python
+connectivity=8
+```
+
+允许横向、纵向以及对角相邻 grid 属于同一个 component。若希望定义更严格的连续性：
+
+```python
+connectivity=4
+```
+
+只允许共享边界的 grid 相连。
+
+`min_connected_grids` 的单位是 grid 数量。例如：
+
+```python
+grid_size=20
+min_connected_grids=3
+```
+
+意味着一个 retained niche 至少包含 3 个 20 × 20 coordinate-unit grids；若坐标单位为 μm，则最小 nominal grid area 为 1,200 μm²。实际 tissue-covered area 仍取决于 occupied grid 的组织覆盖情况。
+
+### 0.3.7 推荐的分析层级
+
+```text
+continuous pathway score
+        ↓
+cohort-wide cutoff
+        ↓
+positive-grid abundance
+        ↓
+connected-component filtering
+        ↓
+niche abundance / niche area / niche cell fraction
+        ↓
+SPHERE relationship analysis / downstream spatial biology
+```
+
+因此可以同时保留两类指标：
+
+```text
+positive_grid_fraction     # pathway-high spatial abundance
+niche_grid_fraction        # spatially organized pathway-high abundance
+n_niches                   # number of disconnected niche domains
+largest_niche_grids        # size of largest niche
+niche_cell_fraction        # fraction of cells residing in niche
 ```
 
 ---

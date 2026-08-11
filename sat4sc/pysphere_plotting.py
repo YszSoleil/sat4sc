@@ -14,12 +14,14 @@ import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap, Normalize
+from matplotlib.colors import LinearSegmentedColormap, Normalize, ListedColormap
 from matplotlib.cm import ScalarMappable
+from matplotlib.collections import LineCollection
+from matplotlib.patches import Patch
 from scipy.stats import gaussian_kde, norm, wilcoxon
 
 from .pysphere import (
-    BinStatResult, CutoffResult, GridFeatureMap, KDTreeDomainResult, PairwiseResult,
+    BinStatResult, CutoffResult, GridFeatureMap, KDTreeDomainResult, NicheResult, PairwiseResult,
     SpatialAdjusted, SpatialVectorResult,
 )
 
@@ -790,4 +792,406 @@ def plot_binary_overlay(
 
 
 
+# -----------------------------------------------------------------------------
+# v0.3.0 niche visualizations
+# -----------------------------------------------------------------------------
+def _get_niche_sample(result: NicheResult, sample: str | None):
+    if sample is None:
+        if len(result.sample_results) != 1:
+            raise ValueError("sample must be provided when NicheResult contains multiple samples.")
+        return next(iter(result.sample_results.values()))
+    key = str(sample)
+    if key not in result.sample_results:
+        raise KeyError(f"Sample {key!r} not found in NicheResult for {result.feature!r}.")
+    return result.sample_results[key]
+
+
+def _categorical_spatial_plot(
+    coords_or_grid,
+    categories: np.ndarray,
+    labels: tuple[str, str, str, str],
+    colors: tuple[str, str, str, str],
+    space: str,
+    ax,
+    point_size: float,
+    x_edges=None,
+    y_edges=None,
+    occupied=None,
+):
+    """Shared 4-category renderer: other, object1, object2, overlap."""
+    if space == "cell":
+        coords = np.asarray(coords_or_grid, dtype=float)
+        for code in range(4):
+            mask = categories == code
+            if mask.any():
+                ax.scatter(
+                    coords[mask, 0], coords[mask, 1], s=point_size, color=colors[code],
+                    edgecolor="none", label=labels[code], rasterized=True, zorder=1 + code,
+                )
+    else:
+        occupied = np.asarray(occupied, dtype=bool)
+        cat = np.asarray(categories, dtype=float)
+        masked = np.ma.masked_where(~occupied, cat)
+        ax.pcolormesh(
+            x_edges, y_edges, masked, cmap=ListedColormap(list(colors)),
+            shading="flat", vmin=-0.5, vmax=3.5, rasterized=True,
+        )
+        handles = [Patch(facecolor=colors[i], edgecolor="none", label=labels[i]) for i in range(4)]
+        ax.legend(handles=handles, frameon=False)
+
+
+def _draw_grid_mask_boundary(
+    ax,
+    mask: np.ndarray,
+    x_edges: np.ndarray,
+    y_edges: np.ndarray,
+    color: str = "black",
+    linewidth: float = 0.8,
+    zorder: float = 5,
+):
+    """Draw exact outer boundaries of a boolean grid mask."""
+    mask = np.asarray(mask, dtype=bool)
+    ny, nx = mask.shape
+    segments = []
+    for y, x in zip(*np.where(mask)):
+        x0, x1 = x_edges[x], x_edges[x + 1]
+        y0, y1 = y_edges[y], y_edges[y + 1]
+        if y == 0 or not mask[y - 1, x]:
+            segments.append([(x0, y0), (x1, y0)])
+        if y == ny - 1 or not mask[y + 1, x]:
+            segments.append([(x0, y1), (x1, y1)])
+        if x == 0 or not mask[y, x - 1]:
+            segments.append([(x0, y0), (x0, y1)])
+        if x == nx - 1 or not mask[y, x + 1]:
+            segments.append([(x1, y0), (x1, y1)])
+    if segments:
+        lc = LineCollection(segments, colors=[color], linewidths=linewidth, zorder=zorder)
+        ax.add_collection(lc)
+    return segments
+
+
+def _resolve_feature_positive_for_niche_plot(
+    adata,
+    niche_sample,
+    feature: str,
+    space: str,
+    sample_key: str,
+    coord_cols,
+    spatial_key: str,
+    layer: str | None,
+    agg: str,
+    cutoff,
+    cutoff_method: str | None,
+    cohort_cutoffs,
+    cutoff_samples,
+    cutoff_n_repeats: int,
+    cutoff_balance_round_to: int,
+    cutoff_balance_n: int | None,
+    cutoff_random_state: int,
+    min_cells_per_bin: int,
+):
+    from . import pysphere as _pysphere
+    mapping = _pysphere._coerce_cutoff_mapping(cohort_cutoffs)
+    if cutoff is not None:
+        resolved = float(cutoff)
+    elif feature in mapping:
+        resolved = float(mapping[feature])
+    elif cutoff_method is not None:
+        cr = _pysphere.calculate_cutoffs(
+            adata, features=[feature], sample_key=sample_key, samples=cutoff_samples,
+            level=space, method=cutoff_method, coord_cols=coord_cols,
+            spatial_key=spatial_key, layer=layer,
+            grid_size=float(niche_sample.x_edges[1] - niche_sample.x_edges[0]),
+            agg=agg,
+            min_cells_per_bin=int(min_cells_per_bin),
+            n_repeats=cutoff_n_repeats,
+            balance_round_to=cutoff_balance_round_to,
+            balance_n=cutoff_balance_n,
+            random_state=cutoff_random_state,
+        )
+        resolved = float(cr.cutoffs[feature])
+    else:
+        resolved = None
+
+    values_cell = _pysphere._resolve_feature_vector(adata, feature, niche_sample.cell_indices, layer=layer)
+    if space == "cell":
+        values = np.asarray(values_cell, dtype=float)
+        c = _resolve_binary_overlay_cutoff(values, resolved)
+        positive = np.isfinite(values) & (values > c)
+        return positive, values, c
+
+    grid_size = float(niche_sample.x_edges[1] - niche_sample.x_edges[0])
+    flat, counts, occupied, shape, xy_min = _pysphere._make_grid(niche_sample.coords, grid_size, int(min_cells_per_bin))
+    if shape != niche_sample.grid.shape or not np.allclose(xy_min, [niche_sample.x_edges[0], niche_sample.y_edges[0]]):
+        raise ValueError("Feature grid geometry does not match the niche grid geometry.")
+    grid = _pysphere._aggregate_grid(values_cell, flat, counts, shape, agg=agg)
+    c = _resolve_binary_overlay_cutoff(grid[niche_sample.occupied & np.isfinite(grid)], resolved)
+    positive = niche_sample.occupied & np.isfinite(grid) & (grid > c)
+    return positive, grid, c
+
+
+def plot_niche_overlay(
+    niche1: NicheResult,
+    niche2: NicheResult,
+    sample: str | None = None,
+    space: str = "grid",
+    ax=None,
+    point_size: float = 4.0,
+    colors: tuple[str, str, str, str] = ("#D9D9D9", "#E76F51", "#4C78A8", "#8E6BBE"),
+    labels: tuple[str, str, str, str] | None = None,
+    invert_y: bool = False,
+    title: str | None = None,
+):
+    """Visualize two niches simultaneously as other/niche1/niche2/overlap.
+
+    ``space='grid'`` displays the retained niche grids. ``space='cell'`` displays
+    cell/spot membership inherited from those niche grids.
+    """
+    space = str(space).lower()
+    if space not in {"grid", "cell"}:
+        raise ValueError("space must be 'grid' or 'cell'.")
+    s1 = _get_niche_sample(niche1, sample)
+    s2 = _get_niche_sample(niche2, sample)
+    if not np.array_equal(s1.cell_indices, s2.cell_indices):
+        raise ValueError("The two niche results do not contain the same cells/spots for this sample.")
+    if s1.niche_grid.shape != s2.niche_grid.shape or not np.allclose(s1.x_edges, s2.x_edges) or not np.allclose(s1.y_edges, s2.y_edges):
+        raise ValueError("The two niche results do not share the same grid geometry.")
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5.8, 5.5))
+    else:
+        fig = ax.figure
+    labels = labels or ("Other", f"{niche1.feature} niche", f"{niche2.feature} niche", "Overlap")
+    if space == "grid":
+        a, b = s1.niche_grid, s2.niche_grid
+        occupied = s1.occupied & s2.occupied
+        categories = np.zeros(a.shape, dtype=np.int8)
+        categories[a & ~b] = 1
+        categories[~a & b] = 2
+        categories[a & b] = 3
+        _categorical_spatial_plot(None, categories, labels, colors, "grid", ax, point_size, s1.x_edges, s1.y_edges, occupied)
+        n_units = int(occupied.sum())
+    else:
+        a, b = s1.cell_niche, s2.cell_niche
+        categories = np.zeros(len(a), dtype=np.int8)
+        categories[a & ~b] = 1
+        categories[~a & b] = 2
+        categories[a & b] = 3
+        _categorical_spatial_plot(s1.coords, categories, labels, colors, "cell", ax, point_size)
+        n_units = int(len(a))
+        ax.legend(frameon=False)
+    if space == "grid":
+        counts = {labels[i]: int(np.sum((categories == i) & occupied)) for i in range(4)}
+    else:
+        counts = {labels[i]: int(np.sum(categories == i)) for i in range(4)}
+    ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+    if invert_y:
+        ax.invert_yaxis()
+    sample_txt = s1.sample
+    ax.set_title(title or f"{niche1.feature} vs {niche2.feature} niches | {sample_txt} ({space})")
+    return fig, ax, {"sample": sample_txt, "space": space, "n_units": n_units, "counts": counts}
+
+
+def plot_niche_positive_overlay(
+    niche: NicheResult,
+    adata,
+    feature: str,
+    sample: str | None = None,
+    space: str = "grid",
+    sample_key: str = "sample_name",
+    coord_cols: tuple[str, str] = ("x_centroid", "y_centroid"),
+    spatial_key: str = "spatial",
+    layer: str | None = None,
+    agg: str = "mean",
+    cutoff=None,
+    cutoff_method: str | None = "balanced_global_mean",
+    cohort_cutoffs=None,
+    cutoff_samples: Sequence[str] | None = None,
+    cutoff_n_repeats: int = 100,
+    cutoff_balance_round_to: int = 1000,
+    cutoff_balance_n: int | None = None,
+    cutoff_random_state: int = 666,
+    ax=None,
+    point_size: float = 4.0,
+    colors: tuple[str, str, str, str] = ("#D9D9D9", "#E76F51", "#4C78A8", "#8E6BBE"),
+    labels: tuple[str, str, str, str] | None = None,
+    invert_y: bool = False,
+    title: str | None = None,
+):
+    """Overlay one retained niche with positive status of another feature.
+
+    Four categories are shown: other, niche only, feature-positive only, overlap.
+    Grid space uses a grid-level feature cutoff; cell space uses a cell-level
+    feature cutoff. Cohort-wide cutoff methods from v0.2.2 are supported.
+    """
+    space = str(space).lower()
+    if space not in {"grid", "cell"}:
+        raise ValueError("space must be 'grid' or 'cell'.")
+    ns = _get_niche_sample(niche, sample)
+    if cutoff_samples is None and cutoff_method is not None:
+        cutoff_samples = niche.settings.get("cutoff_samples", niche.settings.get("samples"))
+    positive, _, resolved_cutoff = _resolve_feature_positive_for_niche_plot(
+        adata, ns, feature, space, sample_key, coord_cols, spatial_key, layer, agg,
+        cutoff, cutoff_method, cohort_cutoffs, cutoff_samples, cutoff_n_repeats,
+        cutoff_balance_round_to, cutoff_balance_n, cutoff_random_state,
+        int(niche.settings.get("min_cells_per_bin", 1)),
+    )
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5.8, 5.5))
+    else:
+        fig = ax.figure
+    labels = labels or ("Other", f"{niche.feature} niche", f"{feature}+", "Overlap")
+    if space == "grid":
+        a = ns.niche_grid
+        b = positive
+        categories = np.zeros(a.shape, dtype=np.int8)
+        categories[a & ~b] = 1; categories[~a & b] = 2; categories[a & b] = 3
+        _categorical_spatial_plot(None, categories, labels, colors, "grid", ax, point_size, ns.x_edges, ns.y_edges, ns.occupied)
+        n_units = int(ns.occupied.sum())
+    else:
+        a = ns.cell_niche
+        b = positive
+        categories = np.zeros(len(a), dtype=np.int8)
+        categories[a & ~b] = 1; categories[~a & b] = 2; categories[a & b] = 3
+        _categorical_spatial_plot(ns.coords, categories, labels, colors, "cell", ax, point_size)
+        n_units = int(len(a))
+        ax.legend(frameon=False)
+    if space == "grid":
+        counts = {labels[i]: int(np.sum((categories == i) & ns.occupied)) for i in range(4)}
+    else:
+        counts = {labels[i]: int(np.sum(categories == i)) for i in range(4)}
+    ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+    if invert_y:
+        ax.invert_yaxis()
+    ax.set_title(title or f"{niche.feature} niche + {feature}+ | {ns.sample} ({space})")
+    return fig, ax, {
+        "sample": ns.sample, "space": space, "feature": feature,
+        "feature_cutoff": float(resolved_cutoff), "cutoff_method": cutoff_method,
+        "n_units": n_units, "counts": counts,
+    }
+
+
+def plot_niche_continuous_feature(
+    niche: NicheResult,
+    adata,
+    feature: str,
+    sample: str | None = None,
+    space: str = "grid",
+    sample_key: str = "sample_name",
+    coord_cols: tuple[str, str] = ("x_centroid", "y_centroid"),
+    spatial_key: str = "spatial",
+    layer: str | None = None,
+    agg: str = "mean",
+    ax=None,
+    cmap: str = "viridis",
+    color_quantiles: tuple[float, float] | None = (0.01, 0.99),
+    vmin: float | None = None,
+    vmax: float | None = None,
+    point_size: float = 4.0,
+    niche_edge_color: str = "black",
+    niche_linewidth: float = 0.55,
+    invert_y: bool = False,
+    title: str | None = None,
+):
+    """Show continuous feature intensity together with niche membership.
+
+    Visualization encoding
+    ----------------------
+    ``space='cell'``
+        All cells/spots are colored by the continuous feature value. Cells that
+        reside in the niche are redrawn with a black outline while retaining the
+        same face color.
+    ``space='grid'``
+        The feature is shown as a continuous raster map and the outer boundary
+        of retained niche grids is drawn in black.
+
+    By default the color scale uses the 1st-99th percentiles of finite values to
+    reduce domination by extreme outliers; this affects only color scaling, not
+    the underlying values or niche definition. Set ``color_quantiles=None`` for
+    the full range, or provide explicit ``vmin``/``vmax``.
+    """
+    from . import pysphere as _pysphere
+    space = str(space).lower()
+    if space not in {"grid", "cell"}:
+        raise ValueError("space must be 'grid' or 'cell'.")
+    ns = _get_niche_sample(niche, sample)
+    values_cell = _pysphere._resolve_feature_vector(adata, feature, ns.cell_indices, layer=layer)
+    if space == "cell":
+        values = np.asarray(values_cell, dtype=float)
+        coords = ns.coords
+        finite = np.isfinite(values)
+        plot_vals = values[finite]
+    else:
+        grid_size = float(ns.x_edges[1] - ns.x_edges[0])
+        flat, counts, occupied, shape, xy_min = _pysphere._make_grid(
+            ns.coords, grid_size, int(niche.settings.get("min_cells_per_bin", 1))
+        )
+        if shape != ns.grid.shape or not np.allclose(xy_min, [ns.x_edges[0], ns.y_edges[0]]):
+            raise ValueError("Feature grid geometry does not match the niche grid geometry.")
+        values = _pysphere._aggregate_grid(values_cell, flat, counts, shape, agg=agg)
+        finite = ns.occupied & np.isfinite(values)
+        plot_vals = values[finite]
+    if plot_vals.size == 0:
+        raise ValueError(f"Feature {feature!r} has no finite values in sample {ns.sample!r}.")
+    if vmin is None or vmax is None:
+        if color_quantiles is None:
+            lo, hi = float(np.nanmin(plot_vals)), float(np.nanmax(plot_vals))
+        else:
+            q0, q1 = map(float, color_quantiles)
+            if not (0 <= q0 < q1 <= 1):
+                raise ValueError("color_quantiles must satisfy 0 <= q0 < q1 <= 1.")
+            lo, hi = np.quantile(plot_vals, [q0, q1]).astype(float)
+        if vmin is None:
+            vmin = float(lo)
+        if vmax is None:
+            vmax = float(hi)
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        raise ValueError("vmin and vmax must be finite.")
+    if np.isclose(vmin, vmax):
+        eps = max(abs(float(vmin)) * 1e-6, 1e-9)
+        vmin, vmax = float(vmin) - eps, float(vmax) + eps
+    norm = Normalize(vmin=float(vmin), vmax=float(vmax), clip=True)
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5.8, 5.5))
+    else:
+        fig = ax.figure
+    if space == "cell":
+        sc = ax.scatter(
+            coords[finite, 0], coords[finite, 1], c=values[finite], cmap=cmap, norm=norm,
+            s=point_size, edgecolors="none", rasterized=True, zorder=1,
+        )
+        niche_mask = finite & ns.cell_niche
+        if niche_mask.any():
+            ax.scatter(
+                coords[niche_mask, 0], coords[niche_mask, 1], c=values[niche_mask],
+                cmap=cmap, norm=norm, s=point_size, edgecolors=niche_edge_color,
+                linewidths=niche_linewidth, rasterized=True, zorder=2,
+            )
+    else:
+        masked = np.ma.masked_where(~finite, values)
+        sc = ax.pcolormesh(
+            ns.x_edges, ns.y_edges, masked, cmap=cmap, norm=norm,
+            shading="flat", rasterized=True, zorder=1,
+        )
+        _draw_grid_mask_boundary(
+            ax, ns.niche_grid, ns.x_edges, ns.y_edges,
+            color=niche_edge_color, linewidth=niche_linewidth, zorder=3,
+        )
+    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(feature)
+    ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+    if invert_y:
+        ax.invert_yaxis()
+    ax.set_title(title or f"{feature} with {niche.feature} niche | {ns.sample} ({space})")
+    return fig, ax, {
+        "sample": ns.sample, "space": space, "feature": feature,
+        "niche_feature": niche.feature, "vmin": float(vmin), "vmax": float(vmax),
+        "color_quantiles": color_quantiles,
+    }
+
+
 __all__.append("plot_binary_overlay")
+__all__.extend([
+    "plot_niche_overlay",
+    "plot_niche_positive_overlay",
+    "plot_niche_continuous_feature",
+])
