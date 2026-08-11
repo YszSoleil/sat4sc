@@ -1,4 +1,4 @@
-# sat4sc -- Spatial Analysis Toolkit For SingleCell
+# sat4sc
 
 `sat4sc` 是面向单细胞/亚细胞分辨率空间转录组的 Python 工具包。当前版本重点实现 `pysphere`：将 SPHERE 的空间位移思想重写为 Python/AnnData 工作流，并同时提供适用于 Xenium / CosMx / MERFISH 等连续细胞坐标的两种 backend。
 
@@ -6,7 +6,7 @@
 from sat4sc import pysphere, pysphere_plotting
 ```
 
-当前版本：**v0.2.0**
+当前版本：**v0.2.1**
 
 ---
 
@@ -17,7 +17,6 @@ sat4sc/
 ├── pyproject.toml
 ├── README.md
 ├── NOTICE.md
-├── LICENSE
 └── sat4sc/
     ├── __init__.py
     ├── pysphere.py      # 计算：grid/KDTree SPHERE、projected score、magnitude、pairwise matrix、module score
@@ -26,11 +25,197 @@ sat4sc/
 
 ---
 
-## 2. v0.2.0 新增功能
+## 2. v0.2.1 更新
+
+本版本在 v0.2.0 基础上更新绘图接口：
+
+1. 原 `plotting.py` **改名为** `pysphere_plotting.py`；原有绘图函数逻辑保持不变。
+2. 新增高层接口：
+
+```python
+pysphere_plotting.plot_binary_overlay()
+```
+
+它直接接受 `AnnData + feature names + sample`，并支持：
+
+```python
+space="cell"
+space="grid"
+```
+
+用于绘制类似论文 Figure 3D / 3G 的两个 binary spatial objects 的空间叠加。
+---
+
+## 3. 三个 spatial plotting 函数的区别
+
+| 函数 | 输入层级 | feature 数量 | 连续/二值 | 空间单位 | 主要用途 |
+|---|---|---:|---|---|---|
+| `plot_grid_feature_map()` | `GridFeatureMap` | 1 | 连续值为主 | grid | 查看 grid-SPHERE 实际看到的某个基因/通路 score；类似 Figure 3C 的逻辑 |
+| `plot_spatial_overlap()` | 两个 `SpatialAdjusted` | 2 | 二值 | 原始 cell/spot | 低层接口；按 cutoff 将两个 feature 二值化后叠加；类似 Figure 3D/G |
+| `plot_binary_overlay()` | `AnnData` + 两个 feature 名 | 2 | 二值 | `cell` 或 `grid` | 高层一步式接口；可直接选择真实细胞空间或 grid-SPHERE 空间 |
+
+三者可以简单理解为：
+
+```text
+plot_grid_feature_map()
+    一个 feature + 连续 score + grid
+
+plot_spatial_overlap()
+    两个 feature + binary + 原始 coordinates + 低层接口
+
+plot_binary_overlay()
+    两个 feature + binary + cell/grid 可选 + AnnData 高层接口
+```
+
+### 3.1 `plot_grid_feature_map()`：单个 feature 的连续 grid map
+
+先生成与 grid-SPHERE 完全相同的 rasterized map：
+
+```python
+grid_map = pysphere.grid_feature_map(
+    adata,
+    feature="Hypoxia_score",
+    sample="sample01",
+    sample_key="sample_name",
+    grid_size=20,
+    agg="mean",
+)
+```
+
+再绘图：
+
+```python
+fig, ax = pysphere_plotting.plot_grid_feature_map(
+    grid_map,
+    cmap="viridis",
+    show_positive_outline=True,
+)
+```
+
+这里颜色表示每个 grid 的连续 `Hypoxia_score`；`show_positive_outline=True` 只额外标出超过 `grid_map.cutoff` 的 high-feature domain。
+
+### 3.2 `plot_spatial_overlap()`：低层 cell/spot binary overlay
+
+先分别构建两个 `SpatialAdjusted`：
+
+```python
+hypoxia = pysphere.spatial_adjust(
+    adata,
+    feature="Hypoxia_score",
+    sample="sample01",
+)
+
+mes1 = pysphere.spatial_adjust(
+    adata,
+    feature="MES1_score",
+    sample="sample01",
+)
+```
+
+再叠加：
+
+```python
+fig, ax = pysphere_plotting.plot_spatial_overlap(
+    hypoxia,
+    mes1,
+    cutoffs=None,
+    colors=("#F2D28B", "#707070"),
+)
+```
+
+`cutoffs=None` 时，两个 feature 都使用各自有限值的均值作为 cutoff。feature 1 为实心点，feature 2 为空心圈。该函数保留为接近原 SPHERE `spatial_cordstat(..., plot_bin=TRUE)` 的低层接口。
+
+### 3.3 `plot_binary_overlay(space="cell")`：一步式 cell-level overlay
+
+```python
+fig, ax, info = pysphere_plotting.plot_binary_overlay(
+    adata,
+    feature1="Hypoxia_score",
+    feature2="MES1_score",
+    sample="sample01",
+    sample_key="sample_name",
+    space="cell",
+    cutoff1="mean",
+    cutoff2="mean",
+    colors=("#F2D28B", "#707070"),
+)
+```
+
+绘图逻辑：
+
+```text
+所有细胞         浅灰背景
+feature1+        实心
+feature2+        空心轮廓
+overlap           feature1 实心上叠 feature2 轮廓
+```
+
+`info` 会返回实际 cutoff 以及 positive/overlap 数量：
+
+```python
+info
+# {
+#   "space": "cell",
+#   "cutoff1": ...,
+#   "cutoff2": ...,
+#   "n_feature1_positive": ...,
+#   "n_feature2_positive": ...,
+#   "n_overlap": ...,
+# }
+```
+
+### 3.4 `plot_binary_overlay(space="grid")`：一步式 grid-level overlay
+
+```python
+fig, ax, info = pysphere_plotting.plot_binary_overlay(
+    adata,
+    feature1="Hypoxia_score",
+    feature2="MES1_score",
+    sample="sample01",
+    sample_key="sample_name",
+    space="grid",
+    grid_size=20,
+    agg="mean",
+    cutoff1="mean",
+    cutoff2="mean",
+)
+```
+
+这里先把两个 feature rasterize 到同一套等面积 grid，再做 binary overlay。因此它展示的是 **grid-SPHERE 真正使用的空间单位**，适合检查进入 Jaccard / ΔJaccard 计算的 spatial objects。
+
+### 3.5 `plot_binary_overlay()` 的 cutoff
+
+`cutoff1` / `cutoff2` 支持：
+
+```python
+"mean"                 # 默认；SPHERE-style
+"median"
+"zero"
+0.25                   # 显式数值
+("quantile", 0.90)     # 90% quantile
+```
+
+例如：
+
+```python
+fig, ax, info = pysphere_plotting.plot_binary_overlay(
+    adata,
+    feature1="Hypoxia_score",
+    feature2="HIF1A",
+    sample="sample01",
+    space="cell",
+    cutoff1=("quantile", 0.8),
+    cutoff2="zero",
+)
+```
+
+---
+
+## 4. v0.2.0 功能回顾
 
 相较 v0.1.0，本版本新增两部分。
 
-### 2.1 KDTree backend
+### 4.1 KDTree backend
 
 直接保留连续细胞坐标，不先做规则网格。算法流程为：
 
@@ -58,7 +243,7 @@ min/max ΔJaccard → projected score / magnitude
 
 该 backend 是 **cell-resolved SPHERE extension**，不是把原 Visium lattice 的“精确坐标匹配”机械搬到 Xenium。
 
-### 2.2 Grid 后的空间可视化
+### 4.2 Grid 后的空间可视化
 
 新增：
 
@@ -77,7 +262,7 @@ pysphere_plotting.plot_grid_feature_map()
 
 ---
 
-## 3. 安装
+## 5. 安装
 
 在仓库根目录：
 
@@ -101,7 +286,7 @@ from sat4sc import pysphere, pysphere_plotting
 
 ---
 
-# 4. 输入 AnnData
+# 6. 输入 AnnData
 
 例如：
 
@@ -151,7 +336,7 @@ adata.obs["BMDM"] = (adata.obs["sub_cell_type"] == "BMDM").astype(float)
 
 ---
 
-# 5. SPHERE 的共同数学框架
+# 7. SPHERE 的共同数学框架
 
 两种 backend 最终都保留同一套 SPHERE 核心统计量。
 
@@ -189,9 +374,9 @@ round_jaccard=4
 
 ---
 
-# 6. Backend 1：regular grid
+# 8. Backend 1：regular grid
 
-## 6.1 原理
+## 8.1 原理
 
 Xenium 坐标是连续值：
 
@@ -219,7 +404,7 @@ steps = (2, 4, 6, 8, 10, 12)
 
 ---
 
-## 6.2 单个样本
+## 8.2 单个样本
 
 ```python
 rs_grid = pysphere.spatial_vector(
@@ -244,7 +429,7 @@ rs_grid.vector_len
 
 ---
 
-## 6.3 多样本
+## 8.3 多样本
 
 ```python
 rs_grid = pysphere.spatial_vector_x(
@@ -275,9 +460,9 @@ rs_grid.sample_vector_len
 
 ---
 
-# 7. 新功能：Grid 后的基因/通路 spatial map
+# 9. Grid 后的基因/通路 spatial map
 
-## 7.1 生成 rasterized feature map
+## 9.1 生成 rasterized feature map
 
 例如查看某个样本的 Hypoxia score 在 `20 μm` grid 上的空间分布：
 
@@ -305,7 +490,7 @@ grid_map.cutoff     # 默认 occupied grid 的 mean
 
 ---
 
-## 7.2 绘图
+## 9.2 绘图
 
 ```python
 fig, ax = pysphere_plotting.plot_grid_feature_map(
@@ -322,7 +507,7 @@ fig.savefig("Hypoxia_grid_spatial.pdf", bbox_inches="tight")
 
 ---
 
-## 7.3 使用自定义 cutoff
+## 9.3 使用自定义 cutoff
 
 直接指定数值：
 
@@ -352,9 +537,9 @@ grid_map = pysphere.grid_feature_map(
 
 ---
 
-# 8. Backend 2：KDTree cell-resolved SPHERE
+# 10. Backend 2：KDTree cell-resolved SPHERE
 
-## 8.1 核心定义
+## 10.1 核心定义
 
 KDTree backend 不构建完整 cell-cell distance matrix。
 
@@ -390,7 +575,7 @@ feature B 同理。
 
 ---
 
-## 8.2 推荐参数含义
+## 10.2 推荐参数含义
 
 ```python
 radius = 15
@@ -406,7 +591,7 @@ steps = (25, 50, 75, 100, 125, 150)
 
 ---
 
-## 8.3 单样本 KDTree SPHERE
+## 10.3 单样本 KDTree SPHERE
 
 ```python
 rs_kd = pysphere.spatial_vector(
@@ -439,7 +624,7 @@ rs_kd = pysphere.spatial_vector_kdtree(
 
 ---
 
-## 8.4 多样本 KDTree SPHERE
+## 10.4 多样本 KDTree SPHERE
 
 ```python
 rs_kd = pysphere.spatial_vector_x(
@@ -474,7 +659,7 @@ rs_kd = pysphere.spatial_vector_x_kdtree(
 
 ---
 
-## 8.5 `direction_mode`
+## 10.5 `direction_mode`
 
 ### 与原 SPHERE 一致
 
@@ -516,7 +701,7 @@ direction_mode="sphere"
 
 ---
 
-## 8.6 组织边界 coverage
+## 10.6 组织边界 coverage
 
 KDTree backend 会计算每个方向虚拟平移后，feature-positive cells 仍能匹配到真实组织 anchor 的比例：
 
@@ -547,11 +732,11 @@ min_coverage=0
 
 ---
 
-# 9. 新功能：KDTree domain spatial visualization
+# 11. KDTree domain spatial visualization
 
 可以直接查看 KDTree backend 实际使用的 target / feature occupancy domain。
 
-## 9.1 原始状态
+## 11.1 原始状态
 
 ```python
 kd_map = pysphere.kdtree_domain_map(
@@ -577,7 +762,7 @@ fig, ax = pysphere_plotting.plot_kdtree_domain_map(
 
 ---
 
-## 9.2 查看虚拟平移后的 B domain
+## 11.2 查看虚拟平移后的 B domain
 
 例如把 inflammation 向左移动 50 μm：
 
@@ -610,7 +795,7 @@ coverage_fraction
 
 ---
 
-# 10. Figure 3B 风格 vector plot：两种 backend 通用
+# 12. Figure 3B 风格 vector plot：两种 backend 通用
 
 Grid：
 
@@ -638,9 +823,9 @@ step (grid cells)
 
 ---
 
-# 11. Figure 3A：pairwise projected-score heatmap
+# 13. Figure 3A：pairwise projected-score heatmap
 
-## 11.1 Grid
+## 13.1 Grid
 
 ```python
 features = [
@@ -665,7 +850,7 @@ fig, ax = pysphere_plotting.plot_projected_heatmap(
 )
 ```
 
-## 11.2 KDTree
+## 13.2 KDTree
 
 ```python
 pair_kd = pysphere.pairwise_projected_scores(
@@ -689,7 +874,7 @@ KDTree pairwise 模式会缓存每个 feature 在最终 step 的 8 个 shifted d
 
 ---
 
-# 12. Figure 3F：paired projected score
+# 14. Figure 3F：paired projected score
 
 无论 grid 还是 KDTree，只要使用 cohort-level `spatial_vector_x()`，都可直接画：
 
@@ -719,7 +904,7 @@ paired Wilcoxon
 
 ---
 
-# 13. Figure 4B：Hypoxia–Inflammation 共定位
+# 15. Figure 4B：Hypoxia–Inflammation 共定位
 
 ## Grid
 
@@ -775,7 +960,7 @@ stat
 
 ---
 
-# 14. cutoff 如何定义
+# 16. cutoff 如何定义
 
 ## Grid backend
 
@@ -797,7 +982,7 @@ positive cell = cell score > mean(cell score)
 
 ---
 
-## 14.1 手动 cutoff
+## 16.1 手动 cutoff
 
 ```python
 rs = pysphere.spatial_vector_x(
@@ -812,7 +997,7 @@ rs = pysphere.spatial_vector_x(
 )
 ```
 
-## 14.2 quantile cutoff
+## 16.2 quantile cutoff
 
 统一分位数：
 
@@ -831,7 +1016,7 @@ quantile_cutoffs={
 
 ---
 
-# 15. 计算 pathway/module score
+# 17. 计算 pathway/module score
 
 提供 Seurat `AddModuleScore` 风格实现：
 
@@ -856,7 +1041,7 @@ pysphere.add_module_scores(
 
 ---
 
-# 16. 性能与内存
+# 18. 性能与内存
 
 ## Grid backend
 
@@ -882,7 +1067,7 @@ pysphere.add_module_scores(
 
 ---
 
-# 17. Grid vs KDTree：推荐怎么用
+# 19. Grid vs KDTree：推荐怎么用
 
 ### 推荐主分析：Grid
 
@@ -920,7 +1105,7 @@ KDTree SPHERE 作为 cell-resolved sensitivity analysis
 
 ---
 
-# 18. 推荐 Xenium 敏感性分析
+# 20. 推荐 Xenium 敏感性分析
 
 Grid：
 
@@ -950,7 +1135,7 @@ steps = (25, 50, 75, 100, 125, 150)
 
 ---
 
-# 19. 最简完整示例
+# 21. 最简完整示例
 
 ```python
 from sat4sc import pysphere, pysphere_plotting

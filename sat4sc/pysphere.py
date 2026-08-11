@@ -1,23 +1,25 @@
 """sat4sc.pysphere
 
-A Python/AnnData-oriented reimplementation of the core ideas in the SPHERE R
-package (woolingxiang/SPHERE), with a regular-grid backend suitable for both
-Visium-like lattices and cell-resolution assays such as Xenium.
+Python/AnnData reimplementation and single-cell extension of the SPHERE spatial
+displacement framework.
 
-The original SPHERE algorithm shifts object B in eight directions, computes
-Jaccard overlap with object A, summarizes the minimum/maximum delta-Jaccard at
-increasing step sizes, then derives a projected score and vector magnitude.
+Two interchangeable backends are provided:
 
-Important adaptation for cell-resolution coordinates
----------------------------------------------------
-SPHERE's R implementation relies on exact coordinate matches after shifting.
-That is natural for Visium array row/column coordinates but not for continuous
-cell centroids. sat4sc therefore rasterizes continuous coordinates to a regular
-2-D grid before applying the same eight-direction displacement logic.
+``backend="grid"``
+    Continuous cell centroids are rasterized to equal-area regular bins, then
+    the original eight-direction SPHERE displacement/Jaccard logic is applied.
+    This is the most faithful adaptation when spatial *area* should carry equal
+    weight and is also suitable for Visium-like lattices.
 
-For exact Visium-like behavior, use integer array coordinates and grid_size=1.
-For Xenium, choose a biologically sensible bin size (for example 10-25 microns)
-and perform a sensitivity analysis across several grid sizes.
+``backend="kdtree"``
+    Continuous cell coordinates are retained. Positive feature cells are
+    converted into radius-defined occupancy domains on the real cell anchors
+    using :class:`scipy.spatial.cKDTree`. Object B is then virtually displaced
+    in eight directions and re-projected onto the fixed anchors before computing
+    Jaccard and delta-Jaccard. This is a cell-resolved extension of SPHERE.
+
+The common downstream quantities are unchanged: minimum/maximum delta-Jaccard
+at each step, final-step projected score, and vector-path magnitude.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ import warnings
 import numpy as np
 import pandas as pd
 from scipy import sparse
+from scipy.spatial import cKDTree
 
 try:
     from anndata import AnnData
@@ -37,6 +40,7 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_STEPS = (2, 4, 6, 8, 10, 12)
+DEFAULT_KDTREE_STEPS = (25.0, 50.0, 75.0, 100.0, 125.0, 150.0)
 DEFAULT_COORD_COLS = ("x_centroid", "y_centroid")
 DIRECTIONS = (
     (1, 0, "add_X"),
@@ -113,6 +117,41 @@ class PairwiseResult:
     sample_scores: pd.DataFrame
     features: list[str]
     settings: dict = field(default_factory=dict)
+
+
+@dataclass
+class GridFeatureMap:
+    """One rasterized gene/signature map for spatial visualization."""
+
+    grid: np.ndarray
+    occupied: np.ndarray
+    counts: np.ndarray
+    x_edges: np.ndarray
+    y_edges: np.ndarray
+    feature: str
+    sample: str | None
+    grid_size: float
+    agg: str
+    cutoff: float
+
+
+@dataclass
+class KDTreeDomainResult:
+    """Radius-defined target/feature domains on fixed cell anchors."""
+
+    coords: np.ndarray
+    target_domain: np.ndarray
+    feature_domain: np.ndarray
+    target_positive: np.ndarray
+    feature_positive: np.ndarray
+    target: str
+    feature: str
+    sample: str | None
+    radius: float
+    cutoff_target: float
+    cutoff_feature: float
+    shift: tuple[float, float] = (0.0, 0.0)
+    coverage_fraction: float = 1.0
 
 
 def _as_index_array(mask_or_index, n_obs: int) -> np.ndarray:
@@ -349,6 +388,69 @@ def _aggregate_grid(
     return out.reshape(shape)
 
 
+
+def grid_feature_map(
+    adata: AnnData,
+    feature: str,
+    sample: str | None = None,
+    sample_key: str = "sample_name",
+    coord_cols: Sequence[str] = DEFAULT_COORD_COLS,
+    spatial_key: str = "spatial",
+    layer: str | None = None,
+    grid_size: float = 20.0,
+    agg: str = "mean",
+    cutoff: float | None = None,
+    quantile_cutoff: float | None = None,
+    min_cells_per_bin: int = 1,
+) -> GridFeatureMap:
+    """Rasterize one gene/signature to the same grid used by ``backend='grid'``.
+
+    The returned object is designed for direct spatial plotting with
+    :func:`sat4sc.pysphere_plotting.plot_grid_feature_map`. ``cutoff`` is optional and is
+    only used to mark high-feature bins in visualization; when omitted, the mean
+    across occupied finite bins is used, matching SPHERE's default threshold.
+    """
+    if sample is None:
+        idx = np.arange(adata.n_obs, dtype=np.int64)
+        sample_name = None
+    else:
+        if sample_key not in adata.obs.columns:
+            raise KeyError(f"sample_key {sample_key!r} not found in adata.obs.")
+        idx = np.flatnonzero(adata.obs[sample_key].astype(str).to_numpy() == str(sample))
+        if idx.size == 0:
+            raise ValueError(f"No observations found for {sample_key}={sample!r}.")
+        sample_name = str(sample)
+    coords = _resolve_coords(adata, idx, coord_cols=coord_cols, spatial_key=spatial_key)
+    values = _resolve_feature_vector(adata, feature, idx, layer=layer)
+    flat, counts, occupied, shape, xy_min = _make_grid(coords, grid_size, min_cells_per_bin)
+    grid = _aggregate_grid(values, flat, counts, shape, agg=agg)
+    vals = grid[occupied & np.isfinite(grid)]
+    if vals.size == 0:
+        chosen = np.nan
+    elif quantile_cutoff is not None:
+        if not 0 <= float(quantile_cutoff) <= 1:
+            raise ValueError("quantile_cutoff must be in [0, 1].")
+        chosen = float(np.quantile(vals, float(quantile_cutoff)))
+    elif cutoff is not None:
+        chosen = float(cutoff)
+    else:
+        chosen = float(np.mean(vals))
+    ny, nx = shape
+    x_edges = xy_min[0] + np.arange(nx + 1, dtype=float) * float(grid_size)
+    y_edges = xy_min[1] + np.arange(ny + 1, dtype=float) * float(grid_size)
+    return GridFeatureMap(
+        grid=grid,
+        occupied=occupied,
+        counts=counts.reshape(shape),
+        x_edges=x_edges,
+        y_edges=y_edges,
+        feature=str(feature),
+        sample=sample_name,
+        grid_size=float(grid_size),
+        agg=str(agg),
+        cutoff=chosen,
+    )
+
 def _choose_cutoff(
     feature: str,
     grid: np.ndarray,
@@ -570,13 +672,254 @@ def spatial_vec_magnitude(vectors: pd.DataFrame, features: Sequence[str] | None 
     return pd.Series(out, name="vector_len")
 
 
-def _single_sample_vectors(
+def _choose_cutoff_values(
+    feature: str,
+    values: np.ndarray,
+    cutoffs: Mapping[str, float] | None = None,
+    quantile_cutoffs: Mapping[str, float] | float | None = None,
+) -> float:
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return np.nan
+    if quantile_cutoffs is not None:
+        q = quantile_cutoffs.get(feature, None) if isinstance(quantile_cutoffs, Mapping) else quantile_cutoffs
+        if q is not None:
+            if not 0 <= float(q) <= 1:
+                raise ValueError("Quantile cutoffs must be in [0, 1].")
+            return float(np.quantile(vals, float(q)))
+    if cutoffs is not None and feature in cutoffs:
+        return float(cutoffs[feature])
+    return float(np.mean(vals))
+
+
+def _normalize_backend_steps(backend: str, steps: Sequence[float] | None) -> tuple[float, ...]:
+    backend = str(backend).lower()
+    if backend not in {"grid", "kdtree"}:
+        raise ValueError("backend must be 'grid' or 'kdtree'.")
+    if steps is None:
+        steps = DEFAULT_STEPS if backend == "grid" else DEFAULT_KDTREE_STEPS
+    if backend == "grid":
+        out = []
+        for x in steps:
+            xf = float(x)
+            if xf <= 0:
+                continue
+            if not np.isclose(xf, round(xf)):
+                raise ValueError("grid backend requires integer steps measured in grid cells.")
+            out.append(float(int(round(xf))))
+    else:
+        out = [float(x) for x in steps if float(x) > 0]
+    out = sorted(set(out))
+    if not out:
+        raise ValueError("steps must contain at least one positive value.")
+    return tuple(out)
+
+
+def _direction_shifts(step: float, direction_mode: str = "sphere"):
+    direction_mode = str(direction_mode).lower()
+    if direction_mode not in {"sphere", "euclidean"}:
+        raise ValueError("direction_mode must be 'sphere' or 'euclidean'.")
+    d = float(step)
+    diag = d if direction_mode == "sphere" else d / np.sqrt(2.0)
+    return (
+        (d, 0.0, "add_X"),
+        (-d, 0.0, "minus_X"),
+        (0.0, d, "add_Y"),
+        (0.0, -d, "minus_Y"),
+        (diag, diag, "add_X_add_Y"),
+        (diag, -diag, "add_X_minus_Y"),
+        (-diag, diag, "minus_X_add_Y"),
+        (-diag, -diag, "minus_X_minus_Y"),
+    )
+
+
+def _domain_from_positive_tree(
+    anchor_coords: np.ndarray,
+    positive_tree: cKDTree | None,
+    radius: float,
+    query_shift: tuple[float, float] = (0.0, 0.0),
+    workers: int = 1,
+) -> np.ndarray:
+    if positive_tree is None:
+        return np.zeros(anchor_coords.shape[0], dtype=bool)
+    shift = np.asarray(query_shift, dtype=float)
+    # x lies within radius of (b + shift) iff (x - shift) lies within radius of b.
+    dist, _ = positive_tree.query(
+        anchor_coords - shift,
+        k=1,
+        distance_upper_bound=float(radius),
+        workers=int(workers),
+    )
+    return np.isfinite(dist)
+
+
+def _kdtree_prepare_feature(
+    coords: np.ndarray,
+    values: np.ndarray,
+    feature: str,
+    radius: float,
+    cutoffs: Mapping[str, float] | None,
+    quantile_cutoffs: Mapping[str, float] | float | None,
+    workers: int,
+):
+    cutoff = _choose_cutoff_values(feature, values, cutoffs, quantile_cutoffs)
+    positive = np.isfinite(values) & (np.asarray(values, dtype=float) > cutoff)
+    positive_coords = coords[positive]
+    tree = cKDTree(positive_coords) if positive_coords.shape[0] else None
+    domain = _domain_from_positive_tree(coords, tree, radius, workers=workers)
+    return cutoff, positive, positive_coords, tree, domain
+
+
+def _shift_coverage(
+    anchor_tree: cKDTree,
+    positive_coords: np.ndarray,
+    shift: tuple[float, float],
+    radius: float,
+    workers: int = 1,
+) -> float:
+    if positive_coords.shape[0] == 0:
+        return np.nan
+    moved = positive_coords + np.asarray(shift, dtype=float)
+    dist, _ = anchor_tree.query(
+        moved,
+        k=1,
+        distance_upper_bound=float(radius),
+        workers=int(workers),
+    )
+    return float(np.mean(np.isfinite(dist)))
+
+
+def _cordstat_from_kdtree(
+    coords: np.ndarray,
+    anchor_tree: cKDTree,
+    target_domain: np.ndarray,
+    feature_domain: np.ndarray,
+    feature_positive_coords: np.ndarray,
+    feature_tree: cKDTree | None,
+    radius: float,
+    step: float,
+    direction_mode: str = "sphere",
+    min_coverage: float = 0.0,
+    workers: int = 1,
+    round_jaccard: int | None = 4,
+) -> pd.DataFrame:
+    if radius <= 0:
+        raise ValueError("radius must be > 0 for backend='kdtree'.")
+    if not 0 <= float(min_coverage) <= 1:
+        raise ValueError("min_coverage must be in [0, 1].")
+    j0 = _jaccard(target_domain, feature_domain)
+    if round_jaccard is not None and np.isfinite(j0):
+        j0 = round(j0, round_jaccard)
+    orig_inter = int(np.count_nonzero(target_domain & feature_domain))
+    orig_a = int(np.count_nonzero(target_domain))
+    orig_b = int(np.count_nonzero(feature_domain))
+    rows = []
+    for dx, dy, name in _direction_shifts(step, direction_mode=direction_mode):
+        shift = (float(dx), float(dy))
+        coverage = _shift_coverage(anchor_tree, feature_positive_coords, shift, radius, workers=workers)
+        valid = np.isnan(coverage) or coverage >= float(min_coverage)
+        if valid:
+            shifted_domain = _domain_from_positive_tree(
+                coords, feature_tree, radius, query_shift=shift, workers=workers
+            )
+            jac = _jaccard(target_domain, shifted_domain)
+            inter = int(np.count_nonzero(target_domain & shifted_domain))
+            n_b = int(np.count_nonzero(shifted_domain))
+        else:
+            jac = np.nan
+            inter = 0
+            n_b = 0
+        if round_jaccard is not None and np.isfinite(jac):
+            jac = round(jac, round_jaccard)
+        diff = jac - j0 if np.isfinite(jac) and np.isfinite(j0) else np.nan
+        rows.append(
+            {
+                "direction": name,
+                "pct_p": jac,
+                "pct_op": j0,
+                "diff_pct": diff,
+                "cnt_p": inter,
+                "cnt_p1": orig_a,
+                "cnt_p2": n_b,
+                "cnt_all": int(coords.shape[0]),
+                "coverage_fraction": coverage,
+                "shift_x": float(dx),
+                "shift_y": float(dy),
+            }
+        )
+    return pd.DataFrame(rows).set_index("direction")
+
+
+def kdtree_domain_map(
+    adata: AnnData,
+    target: str,
+    feature: str,
+    sample: str | None = None,
+    sample_key: str = "sample_name",
+    coord_cols: Sequence[str] = DEFAULT_COORD_COLS,
+    spatial_key: str = "spatial",
+    layer: str | None = None,
+    radius: float = 15.0,
+    cutoffs: Mapping[str, float] | None = None,
+    quantile_cutoffs: Mapping[str, float] | float | None = None,
+    shift: tuple[float, float] = (0.0, 0.0),
+    workers: int = 1,
+) -> KDTreeDomainResult:
+    """Prepare target/feature radius domains for direct spatial visualization.
+
+    ``shift`` is in the original coordinate units (typically microns for Xenium)
+    and is applied virtually to ``feature`` before it is re-projected onto the
+    fixed cell anchors.
+    """
+    if radius <= 0:
+        raise ValueError("radius must be > 0.")
+    if sample is None:
+        idx = np.arange(adata.n_obs, dtype=np.int64)
+        sample_name = None
+    else:
+        if sample_key not in adata.obs.columns:
+            raise KeyError(f"sample_key {sample_key!r} not found in adata.obs.")
+        idx = np.flatnonzero(adata.obs[sample_key].astype(str).to_numpy() == str(sample))
+        if idx.size == 0:
+            raise ValueError(f"No observations found for {sample_key}={sample!r}.")
+        sample_name = str(sample)
+    coords = _resolve_coords(adata, idx, coord_cols=coord_cols, spatial_key=spatial_key)
+    target_values = _resolve_feature_vector(adata, target, idx, layer=layer)
+    feature_values = _resolve_feature_vector(adata, feature, idx, layer=layer)
+    ct, tpos, tcoords, ttree, tdomain = _kdtree_prepare_feature(
+        coords, target_values, target, radius, cutoffs, quantile_cutoffs, workers
+    )
+    cf, fpos, fcoords, ftree, _ = _kdtree_prepare_feature(
+        coords, feature_values, feature, radius, cutoffs, quantile_cutoffs, workers
+    )
+    anchor_tree = cKDTree(coords)
+    fdomain = _domain_from_positive_tree(coords, ftree, radius, query_shift=shift, workers=workers)
+    coverage = _shift_coverage(anchor_tree, fcoords, shift, radius, workers=workers)
+    return KDTreeDomainResult(
+        coords=coords,
+        target_domain=tdomain,
+        feature_domain=fdomain,
+        target_positive=tpos,
+        feature_positive=fpos,
+        target=str(target),
+        feature=str(feature),
+        sample=sample_name,
+        radius=float(radius),
+        cutoff_target=float(ct),
+        cutoff_feature=float(cf),
+        shift=(float(shift[0]), float(shift[1])),
+        coverage_fraction=float(coverage) if np.isfinite(coverage) else np.nan,
+    )
+
+
+def _single_sample_vectors_grid(
     adata: AnnData,
     obs_idx: np.ndarray,
     sample_name: str,
     target: str,
     features: Sequence[str],
-    steps: Sequence[int],
+    steps: Sequence[float],
     coord_cols: Sequence[str],
     spatial_key: str,
     layer: str | None,
@@ -592,54 +935,146 @@ def _single_sample_vectors(
     target_values = _resolve_feature_vector(adata, target, obs_idx, layer=layer)
     target_grid = _aggregate_grid(target_values, flat, counts, shape, agg=agg)
     cutoff_target = _choose_cutoff(target, target_grid, occupied, cutoffs, quantile_cutoffs)
-
     rows = []
     for feature in features:
         try:
             feature_values = _resolve_feature_vector(adata, feature, obs_idx, layer=layer)
         except KeyError:
             for step in steps:
-                rows.append(
-                    {
-                        "min_djaccard": np.nan,
-                        "max_djaccard": np.nan,
-                        "feature": feature,
-                        "step": int(step),
-                        "sample": sample_name,
-                    }
-                )
+                rows.append({"min_djaccard": np.nan, "max_djaccard": np.nan, "feature": feature, "step": float(step), "sample": sample_name})
             continue
         feature_grid = _aggregate_grid(feature_values, flat, counts, shape, agg=agg)
         cutoff_feature = _choose_cutoff(feature, feature_grid, occupied, cutoffs, quantile_cutoffs)
         for step in steps:
             stat = _cordstat_from_grids(
-                target_grid,
-                feature_grid,
-                occupied,
-                cutoff_target,
-                cutoff_feature,
-                int(step),
-                round_jaccard=round_jaccard,
+                target_grid, feature_grid, occupied, cutoff_target, cutoff_feature,
+                int(round(step)), round_jaccard=round_jaccard,
             )
             diff = stat["diff_pct"].to_numpy(dtype=float)
-            if np.isfinite(diff).any():
-                mn = float(np.nanmin(diff))
-                mx = float(np.nanmax(diff))
-            else:
-                mn = mx = np.nan
+            mn = float(np.nanmin(diff)) if np.isfinite(diff).any() else np.nan
+            mx = float(np.nanmax(diff)) if np.isfinite(diff).any() else np.nan
             rows.append(
                 {
                     "min_djaccard": mn,
                     "max_djaccard": mx,
                     "feature": feature,
-                    "step": int(step),
+                    "step": float(step),
                     "sample": sample_name,
                     "cutoff_target": cutoff_target,
                     "cutoff_feature": cutoff_feature,
                     "n_bins": int(occupied.sum()),
+                    "backend": "grid",
                 }
             )
     return pd.DataFrame(rows)
+
+
+def _single_sample_vectors_kdtree(
+    adata: AnnData,
+    obs_idx: np.ndarray,
+    sample_name: str,
+    target: str,
+    features: Sequence[str],
+    steps: Sequence[float],
+    coord_cols: Sequence[str],
+    spatial_key: str,
+    layer: str | None,
+    radius: float,
+    cutoffs: Mapping[str, float] | None,
+    quantile_cutoffs: Mapping[str, float] | float | None,
+    direction_mode: str,
+    min_coverage: float,
+    workers: int,
+    round_jaccard: int | None,
+) -> pd.DataFrame:
+    coords = _resolve_coords(adata, obs_idx, coord_cols=coord_cols, spatial_key=spatial_key)
+    anchor_tree = cKDTree(coords)
+    target_values = _resolve_feature_vector(adata, target, obs_idx, layer=layer)
+    cutoff_target, _, _, _, target_domain = _kdtree_prepare_feature(
+        coords, target_values, target, radius, cutoffs, quantile_cutoffs, workers
+    )
+    rows = []
+    for feature in features:
+        try:
+            feature_values = _resolve_feature_vector(adata, feature, obs_idx, layer=layer)
+        except KeyError:
+            for step in steps:
+                rows.append({"min_djaccard": np.nan, "max_djaccard": np.nan, "feature": feature, "step": float(step), "sample": sample_name})
+            continue
+        cutoff_feature, positive, positive_coords, feature_tree, feature_domain = _kdtree_prepare_feature(
+            coords, feature_values, feature, radius, cutoffs, quantile_cutoffs, workers
+        )
+        for step in steps:
+            stat = _cordstat_from_kdtree(
+                coords=coords,
+                anchor_tree=anchor_tree,
+                target_domain=target_domain,
+                feature_domain=feature_domain,
+                feature_positive_coords=positive_coords,
+                feature_tree=feature_tree,
+                radius=radius,
+                step=float(step),
+                direction_mode=direction_mode,
+                min_coverage=min_coverage,
+                workers=workers,
+                round_jaccard=round_jaccard,
+            )
+            diff = stat["diff_pct"].to_numpy(dtype=float)
+            mn = float(np.nanmin(diff)) if np.isfinite(diff).any() else np.nan
+            mx = float(np.nanmax(diff)) if np.isfinite(diff).any() else np.nan
+            cov = stat["coverage_fraction"].to_numpy(dtype=float)
+            rows.append(
+                {
+                    "min_djaccard": mn,
+                    "max_djaccard": mx,
+                    "feature": feature,
+                    "step": float(step),
+                    "sample": sample_name,
+                    "cutoff_target": cutoff_target,
+                    "cutoff_feature": cutoff_feature,
+                    "n_anchors": int(coords.shape[0]),
+                    "n_positive_feature": int(np.count_nonzero(positive)),
+                    "min_direction_coverage": float(np.nanmin(cov)) if np.isfinite(cov).any() else np.nan,
+                    "mean_direction_coverage": float(np.nanmean(cov)) if np.isfinite(cov).any() else np.nan,
+                    "backend": "kdtree",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _single_sample_vectors(
+    adata: AnnData,
+    obs_idx: np.ndarray,
+    sample_name: str,
+    target: str,
+    features: Sequence[str],
+    steps: Sequence[float],
+    coord_cols: Sequence[str],
+    spatial_key: str,
+    layer: str | None,
+    backend: str,
+    grid_size: float,
+    agg: str,
+    cutoffs: Mapping[str, float] | None,
+    quantile_cutoffs: Mapping[str, float] | float | None,
+    min_cells_per_bin: int,
+    radius: float,
+    direction_mode: str,
+    min_coverage: float,
+    workers: int,
+    round_jaccard: int | None,
+) -> pd.DataFrame:
+    if backend == "grid":
+        return _single_sample_vectors_grid(
+            adata, obs_idx, sample_name, target, features, steps, coord_cols,
+            spatial_key, layer, grid_size, agg, cutoffs, quantile_cutoffs,
+            min_cells_per_bin, round_jaccard,
+        )
+    return _single_sample_vectors_kdtree(
+        adata, obs_idx, sample_name, target, features, steps, coord_cols,
+        spatial_key, layer, radius, cutoffs, quantile_cutoffs, direction_mode,
+        min_coverage, workers, round_jaccard,
+    )
 
 
 def spatial_vector(
@@ -648,48 +1083,50 @@ def spatial_vector(
     features: Sequence[str],
     sample: str | None = None,
     sample_key: str = "sample_name",
-    steps: Sequence[int] = DEFAULT_STEPS,
+    steps: Sequence[float] | None = None,
     coord_cols: Sequence[str] = DEFAULT_COORD_COLS,
     spatial_key: str = "spatial",
     layer: str | None = None,
+    backend: str = "grid",
     grid_size: float = 20.0,
     agg: str = "mean",
     cutoffs: Mapping[str, float] | None = None,
     quantile_cutoffs: Mapping[str, float] | float | None = None,
     min_cells_per_bin: int = 1,
+    radius: float = 15.0,
+    direction_mode: str = "sphere",
+    min_coverage: float = 0.0,
+    workers: int = 1,
     round_jaccard: int | None = 4,
 ) -> SpatialVectorResult:
-    """Generate SPHERE vectors for one tissue/sample.
+    """Generate SPHERE vectors for one tissue/sample with grid or KDTree backend.
 
-    If ``sample`` is None, all observations are treated as one spatial section.
-    ``steps`` are measured in grid cells. Thus with grid_size=20 microns,
-    steps=(2,4,...,12) correspond to 40,80,...,240 microns.
+    Grid steps are measured in grid cells. KDTree steps are measured directly in
+    the coordinate units (normally microns for Xenium).
     """
+    backend = str(backend).lower()
     features = list(map(str, features))
-    steps = tuple(sorted({int(x) for x in steps if int(x) > 0}))
-    if not steps:
-        raise ValueError("steps must contain at least one positive integer.")
-
+    steps = _normalize_backend_steps(backend, steps)
     if sample is None:
         idx = np.arange(adata.n_obs, dtype=np.int64)
         sample_name = "obj"
     else:
         if sample_key not in adata.obs.columns:
             raise KeyError(f"sample_key {sample_key!r} not found in adata.obs.")
-        mask = adata.obs[sample_key].astype(str).to_numpy() == str(sample)
-        idx = np.flatnonzero(mask)
+        idx = np.flatnonzero(adata.obs[sample_key].astype(str).to_numpy() == str(sample))
         if idx.size == 0:
             raise ValueError(f"No observations found for {sample_key}={sample!r}.")
         sample_name = str(sample)
-
     vectors = _single_sample_vectors(
         adata, idx, sample_name, target, features, steps, coord_cols, spatial_key,
-        layer, grid_size, agg, cutoffs, quantile_cutoffs, min_cells_per_bin, round_jaccard,
+        layer, backend, grid_size, agg, cutoffs, quantile_cutoffs,
+        min_cells_per_bin, radius, direction_mode, min_coverage, workers,
+        round_jaccard,
     )
     projected = spatial_vec_proj(vectors)
     magnitude = spatial_vec_magnitude(vectors, features)
     final = vectors.loc[vectors["step"] == max(steps), ["sample", "feature", "min_djaccard", "max_djaccard"]].copy()
-    final["projected_score"] = np.nansum(final[["min_djaccard", "max_djaccard"]].to_numpy(), axis=1) / 2.0
+    final["projected_score"] = np.nansum(final[["min_djaccard", "max_djaccard"]].to_numpy(dtype=float), axis=1) / 2.0
     sample_mag = pd.DataFrame({"sample": sample_name, "feature": magnitude.index, "vector_len": magnitude.values})
     return SpatialVectorResult(
         vectors=vectors,
@@ -701,9 +1138,13 @@ def spatial_vector(
         sample_projected_score=final,
         sample_vector_len=sample_mag,
         settings={
+            "backend": backend,
             "steps": steps,
-            "grid_size": grid_size,
-            "agg": agg,
+            "grid_size": grid_size if backend == "grid" else None,
+            "radius": radius if backend == "kdtree" else None,
+            "direction_mode": direction_mode if backend == "kdtree" else None,
+            "min_coverage": min_coverage if backend == "kdtree" else None,
+            "agg": agg if backend == "grid" else None,
             "sample_key": sample_key,
             "coord_cols": tuple(coord_cols),
             "spatial_key": spatial_key,
@@ -719,33 +1160,33 @@ def spatial_vector_x(
     features: Sequence[str],
     sample_key: str = "sample_name",
     samples: Sequence[str] | None = None,
-    steps: Sequence[int] = DEFAULT_STEPS,
+    steps: Sequence[float] | None = None,
     coord_cols: Sequence[str] = DEFAULT_COORD_COLS,
     spatial_key: str = "spatial",
     layer: str | None = None,
+    backend: str = "grid",
     grid_size: float = 20.0,
     agg: str = "mean",
     cutoffs: Mapping[str, float] | None = None,
     quantile_cutoffs: Mapping[str, float] | float | None = None,
     min_cells_per_bin: int = 1,
+    radius: float = 15.0,
+    direction_mode: str = "sphere",
+    min_coverage: float = 0.0,
+    workers: int = 1,
     round_jaccard: int | None = 4,
     verbose: bool = True,
 ) -> SpatialVectorResult:
-    """Cohort-level analogue of SPHERE::spatial_vectorX using one AnnData object.
-
-    Each value in ``adata.obs[sample_key]`` is treated as an independent tissue
-    section. Per-sample vectors are computed first, then min/max delta-Jaccard are
-    averaged across samples at each feature/step, matching the R package design.
-    """
+    """Cohort-level SPHERE analysis using either regular-grid or KDTree backend."""
+    backend = str(backend).lower()
+    steps = _normalize_backend_steps(backend, steps)
     if sample_key not in adata.obs.columns:
         raise KeyError(f"sample_key {sample_key!r} not found in adata.obs.")
     features = list(map(str, features))
-    steps = tuple(sorted({int(x) for x in steps if int(x) > 0}))
     if samples is None:
         samples = list(pd.unique(adata.obs[sample_key].astype(str)))
     else:
         samples = list(map(str, samples))
-
     sample_values = adata.obs[sample_key].astype(str).to_numpy()
     raw_parts = []
     for i, sample in enumerate(samples, start=1):
@@ -754,18 +1195,19 @@ def spatial_vector_x(
             warnings.warn(f"Skipping sample {sample!r}: no observations.")
             continue
         if verbose:
-            print(f"[sat4sc] {i}/{len(samples)} {sample}: {idx.size:,} cells/spots")
+            extra = f"grid={grid_size:g}" if backend == "grid" else f"radius={radius:g}"
+            print(f"[sat4sc:{backend}] {i}/{len(samples)} {sample}: {idx.size:,} cells/spots, {extra}")
         raw_parts.append(
             _single_sample_vectors(
                 adata, idx, sample, target, features, steps, coord_cols, spatial_key,
-                layer, grid_size, agg, cutoffs, quantile_cutoffs, min_cells_per_bin,
+                layer, backend, grid_size, agg, cutoffs, quantile_cutoffs,
+                min_cells_per_bin, radius, direction_mode, min_coverage, workers,
                 round_jaccard,
             )
         )
     if not raw_parts:
         raise ValueError("No valid samples were analyzed.")
     pool_raw = pd.concat(raw_parts, ignore_index=True)
-
     vectors = (
         pool_raw.groupby(["feature", "step"], sort=False, observed=True)[["min_djaccard", "max_djaccard"]]
         .mean()
@@ -774,22 +1216,19 @@ def spatial_vector_x(
     vectors["sample"] = "obj"
     projected = spatial_vec_proj(vectors)
     magnitude = spatial_vec_magnitude(vectors, features)
-
     max_step = max(steps)
     sample_projected = pool_raw.loc[
         pool_raw["step"] == max_step,
         ["sample", "feature", "min_djaccard", "max_djaccard"],
     ].copy()
-    sample_projected["projected_score"] = (
-        np.nansum(sample_projected[["min_djaccard", "max_djaccard"]].to_numpy(dtype=float), axis=1) / 2.0
-    )
-
+    sample_projected["projected_score"] = np.nansum(
+        sample_projected[["min_djaccard", "max_djaccard"]].to_numpy(dtype=float), axis=1
+    ) / 2.0
     mag_rows = []
     for sample, df in pool_raw.groupby("sample", sort=False):
         mag = spatial_vec_magnitude(df, features)
         mag_rows.extend({"sample": sample, "feature": k, "vector_len": v} for k, v in mag.items())
     sample_magnitude = pd.DataFrame(mag_rows)
-
     return SpatialVectorResult(
         vectors=vectors,
         target=target,
@@ -800,9 +1239,14 @@ def spatial_vector_x(
         sample_projected_score=sample_projected,
         sample_vector_len=sample_magnitude,
         settings={
+            "backend": backend,
             "steps": steps,
-            "grid_size": grid_size,
-            "agg": agg,
+            "grid_size": grid_size if backend == "grid" else None,
+            "radius": radius if backend == "kdtree" else None,
+            "direction_mode": direction_mode if backend == "kdtree" else None,
+            "min_coverage": min_coverage if backend == "kdtree" else None,
+            "workers": workers if backend == "kdtree" else None,
+            "agg": agg if backend == "grid" else None,
             "sample_key": sample_key,
             "samples": samples,
             "coord_cols": tuple(coord_cols),
@@ -818,24 +1262,35 @@ def pairwise_projected_scores(
     features: Sequence[str],
     sample_key: str = "sample_name",
     samples: Sequence[str] | None = None,
-    final_step: int = 12,
+    final_step: float | None = None,
     coord_cols: Sequence[str] = DEFAULT_COORD_COLS,
     spatial_key: str = "spatial",
     layer: str | None = None,
+    backend: str = "grid",
     grid_size: float = 20.0,
     agg: str = "mean",
     cutoffs: Mapping[str, float] | None = None,
     quantile_cutoffs: Mapping[str, float] | float | None = None,
     min_cells_per_bin: int = 1,
+    radius: float = 15.0,
+    direction_mode: str = "sphere",
+    min_coverage: float = 0.0,
+    workers: int = 1,
     round_jaccard: int | None = 4,
     verbose: bool = True,
 ) -> PairwiseResult:
-    """Compute a Figure-3A-like pairwise projected-score matrix efficiently.
+    """Figure-3A-like pairwise projected-score matrix for either backend.
 
-    Only the final displacement step is calculated, because projected score uses
-    the final step. Feature grids are prepared once per sample, avoiding repeated
-    AnnData slicing and repeated rasterization.
+    Only the final displacement is calculated. For KDTree, shifted feature
+    domains are cached once per feature/sample and reused across all targets.
     """
+    backend = str(backend).lower()
+    if backend not in {"grid", "kdtree"}:
+        raise ValueError("backend must be 'grid' or 'kdtree'.")
+    if final_step is None:
+        final_step = float(DEFAULT_STEPS[-1] if backend == "grid" else DEFAULT_KDTREE_STEPS[-1])
+    if backend == "grid" and not np.isclose(float(final_step), round(float(final_step))):
+        raise ValueError("grid backend requires integer final_step.")
     if sample_key not in adata.obs.columns:
         raise KeyError(f"sample_key {sample_key!r} not found in adata.obs.")
     features = list(map(str, features))
@@ -844,45 +1299,79 @@ def pairwise_projected_scores(
     else:
         samples = list(map(str, samples))
     sample_values = adata.obs[sample_key].astype(str).to_numpy()
-
     rows = []
     for i, sample in enumerate(samples, start=1):
         idx = np.flatnonzero(sample_values == sample)
         if idx.size == 0:
             continue
         if verbose:
-            print(f"[sat4sc] pairwise {i}/{len(samples)} {sample}: {idx.size:,} cells/spots")
+            print(f"[sat4sc:{backend}] pairwise {i}/{len(samples)} {sample}: {idx.size:,} cells/spots")
         coords = _resolve_coords(adata, idx, coord_cols=coord_cols, spatial_key=spatial_key)
-        flat, counts, occupied, shape, _ = _make_grid(coords, grid_size, min_cells_per_bin)
-        grids = {}
-        masks = {}
-        for feature in features:
-            values = _resolve_feature_vector(adata, feature, idx, layer=layer)
-            grid = _aggregate_grid(values, flat, counts, shape, agg=agg)
-            cutoff = _choose_cutoff(feature, grid, occupied, cutoffs, quantile_cutoffs)
-            grids[feature] = grid
-            masks[feature] = occupied & np.isfinite(grid) & (grid > cutoff)
-
-        for target in features:
+        if backend == "grid":
+            flat, counts, occupied, shape, _ = _make_grid(coords, grid_size, min_cells_per_bin)
+            grids = {}
+            thresholds = {}
             for feature in features:
-                if target == feature:
-                    score = np.nan
-                else:
-                    # Use the same low-level routine to preserve SPHERE semantics.
-                    c_t = _choose_cutoff(target, grids[target], occupied, cutoffs, quantile_cutoffs)
-                    c_f = _choose_cutoff(feature, grids[feature], occupied, cutoffs, quantile_cutoffs)
-                    stat = _cordstat_from_grids(
-                        grids[target], grids[feature], occupied, c_t, c_f,
-                        int(final_step), round_jaccard=round_jaccard,
-                    )
-                    d = stat["diff_pct"].to_numpy(dtype=float)
-                    if np.isfinite(d).any():
-                        mn, mx = float(np.nanmin(d)), float(np.nanmax(d))
-                        score = float(np.nansum([mn, mx]) / 2.0)
-                    else:
+                values = _resolve_feature_vector(adata, feature, idx, layer=layer)
+                grid = _aggregate_grid(values, flat, counts, shape, agg=agg)
+                grids[feature] = grid
+                thresholds[feature] = _choose_cutoff(feature, grid, occupied, cutoffs, quantile_cutoffs)
+            for target in features:
+                for feature in features:
+                    if target == feature:
                         score = np.nan
-                rows.append({"sample": sample, "target": target, "feature": feature, "projected_score": score})
-
+                    else:
+                        stat = _cordstat_from_grids(
+                            grids[target], grids[feature], occupied,
+                            thresholds[target], thresholds[feature], int(round(float(final_step))),
+                            round_jaccard=round_jaccard,
+                        )
+                        d = stat["diff_pct"].to_numpy(dtype=float)
+                        score = float(np.nansum([np.nanmin(d), np.nanmax(d)]) / 2.0) if np.isfinite(d).any() else np.nan
+                    rows.append({"sample": sample, "target": target, "feature": feature, "projected_score": score})
+        else:
+            anchor_tree = cKDTree(coords)
+            prepared = {}
+            for feature in features:
+                values = _resolve_feature_vector(adata, feature, idx, layer=layer)
+                prepared[feature] = _kdtree_prepare_feature(
+                    coords, values, feature, radius, cutoffs, quantile_cutoffs, workers
+                )
+            shifted_cache = {}
+            for feature in features:
+                _, _, pos_coords, ftree, fdomain = prepared[feature]
+                j_domains = []
+                for dx, dy, name in _direction_shifts(float(final_step), direction_mode=direction_mode):
+                    shift = (float(dx), float(dy))
+                    cov = _shift_coverage(anchor_tree, pos_coords, shift, radius, workers=workers)
+                    if np.isnan(cov) or cov >= min_coverage:
+                        dom = _domain_from_positive_tree(coords, ftree, radius, query_shift=shift, workers=workers)
+                    else:
+                        dom = None
+                    j_domains.append((name, dom, cov))
+                shifted_cache[feature] = (fdomain, j_domains)
+            for target in features:
+                tdomain = prepared[target][4]
+                for feature in features:
+                    if target == feature:
+                        score = np.nan
+                    else:
+                        fdomain, shifted = shifted_cache[feature]
+                        j0 = _jaccard(tdomain, fdomain)
+                        if round_jaccard is not None and np.isfinite(j0):
+                            j0 = round(j0, round_jaccard)
+                        diffs = []
+                        for _, dom, _ in shifted:
+                            if dom is None:
+                                diffs.append(np.nan)
+                                continue
+                            jac = _jaccard(tdomain, dom)
+                            if round_jaccard is not None and np.isfinite(jac):
+                                jac = round(jac, round_jaccard)
+                            diffs.append(jac - j0 if np.isfinite(jac) and np.isfinite(j0) else np.nan)
+                        d = np.asarray(diffs, dtype=float)
+                        score = float(np.nansum([np.nanmin(d), np.nanmax(d)]) / 2.0) if np.isfinite(d).any() else np.nan
+                    rows.append({"sample": sample, "target": target, "feature": feature, "projected_score": score})
     sample_scores = pd.DataFrame(rows)
     matrix = sample_scores.pivot_table(
         index="target", columns="feature", values="projected_score", aggfunc="mean", sort=False
@@ -892,9 +1381,14 @@ def pairwise_projected_scores(
         sample_scores=sample_scores,
         features=features,
         settings={
-            "final_step": int(final_step),
-            "grid_size": grid_size,
-            "agg": agg,
+            "backend": backend,
+            "final_step": float(final_step),
+            "grid_size": grid_size if backend == "grid" else None,
+            "radius": radius if backend == "kdtree" else None,
+            "direction_mode": direction_mode if backend == "kdtree" else None,
+            "min_coverage": min_coverage if backend == "kdtree" else None,
+            "workers": workers if backend == "kdtree" else None,
+            "agg": agg if backend == "grid" else None,
             "sample_key": sample_key,
             "samples": samples,
             "coord_cols": tuple(coord_cols),
@@ -903,6 +1397,24 @@ def pairwise_projected_scores(
             "round_jaccard": round_jaccard,
         },
     )
+
+
+def spatial_vector_kdtree(*args, **kwargs) -> SpatialVectorResult:
+    """Convenience wrapper for ``spatial_vector(..., backend='kdtree')``."""
+    kwargs["backend"] = "kdtree"
+    return spatial_vector(*args, **kwargs)
+
+
+def spatial_vector_x_kdtree(*args, **kwargs) -> SpatialVectorResult:
+    """Convenience wrapper for ``spatial_vector_x(..., backend='kdtree')``."""
+    kwargs["backend"] = "kdtree"
+    return spatial_vector_x(*args, **kwargs)
+
+
+def pairwise_projected_scores_kdtree(*args, **kwargs) -> PairwiseResult:
+    """Convenience wrapper for ``pairwise_projected_scores(..., backend='kdtree')``."""
+    kwargs["backend"] = "kdtree"
+    return pairwise_projected_scores(*args, **kwargs)
 
 
 def _mean_over_columns(X, cols: np.ndarray) -> np.ndarray:
@@ -975,6 +1487,7 @@ def add_module_scores(
 spatial_vectorX = spatial_vector_x
 spatial_vecProj = spatial_vec_proj
 spatial_vecMagnitude = spatial_vec_magnitude
+spatial_vectorX_kdtree = spatial_vector_x_kdtree
 
 
 __all__ = [
@@ -983,16 +1496,24 @@ __all__ = [
     "CordStatResult",
     "SpatialVectorResult",
     "PairwiseResult",
+    "GridFeatureMap",
+    "KDTreeDomainResult",
     "spatial_adjust",
     "spatial_binstat",
+    "grid_feature_map",
+    "kdtree_domain_map",
     "spatial_cordstat",
     "spatial_vector",
     "spatial_vector_x",
     "spatial_vectorX",
+    "spatial_vector_kdtree",
+    "spatial_vector_x_kdtree",
+    "spatial_vectorX_kdtree",
     "spatial_vec_proj",
     "spatial_vecProj",
     "spatial_vec_magnitude",
     "spatial_vecMagnitude",
     "pairwise_projected_scores",
+    "pairwise_projected_scores_kdtree",
     "add_module_scores",
 ]
