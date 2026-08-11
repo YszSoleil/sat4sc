@@ -149,7 +149,7 @@ def plot_projected_heatmap(
     mat = result.matrix.copy() if isinstance(result, PairwiseResult) else result.copy()
     if order is not None:
         mat = mat.reindex(index=order, columns=order)
-    arr = mat.to_numpy(dtype=float)
+    arr = mat.to_numpy(dtype=float, copy=True)
     if triangle == "lower":
         arr[np.triu_indices_from(arr, k=0)] = np.nan
     elif triangle == "upper":
