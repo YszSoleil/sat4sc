@@ -1,34 +1,312 @@
 # sat4sc
 
-`sat4sc` 是面向单细胞/亚细胞分辨率空间转录组的 Python 工具包。当前版本重点实现 `pysphere`：将 SPHERE 的空间位移思想重写为 Python/AnnData 工作流，并同时提供适用于 Xenium / CosMx / MERFISH 等连续细胞坐标的两种 backend。
+`sat4sc` 是面向单细胞/亚细胞分辨率空间转录组的 Python 工具包。当前版本重点实现 `pysphere`：将 SPHERE 的空间位移思想重写为 Python/AnnData 工作流，并提供 regular-grid SPHERE、spatial niche、cohort-wide cutoff、pairwise projected score 以及相关可视化。
 
 ```python
 from sat4sc import pysphere, pysphere_plotting
 ```
 
-当前版本：**v0.3.0**
+当前版本：**v0.4.0**
+
+> 推荐使用 `backend="grid"`。`backend="kdtree"` 在 v0.4.0 中保留为**实验性功能**，适合需要 cell-resolved radius-domain 行为的探索性分析，但不建议作为常规默认 backend。
 
 ---
 
-## 1. 目录结构
+## 1. v0.4.0 主要更新：SPHERE 可以直接使用 niche 身份
+
+v0.3.x 中，SPHERE 的 binary spatial object 主要来自：
 
 ```text
-sat4sc/
-├── pyproject.toml
-├── README.md
-├── NOTICE.md
-├── LICENSE
-└── sat4sc/
-    ├── __init__.py
-    ├── pysphere.py      # 计算：grid/KDTree SPHERE、cohort cutoff、positive grid、spatial niche、module score
-    └── pysphere_plotting.py      # 绘图：SPHERE figures、binary overlay、niche overlay、niche + continuous feature
+continuous feature / gene expression
+        ↓
+cutoff
+        ↓
+feature-positive cells / grids
+        ↓
+Jaccard / shifted Jaccard / ΔJaccard
+```
+
+v0.4.0 新增 `niche_features=` 参数。对于你指定的一个或多个 feature，可以不再使用 `xxx_positive cell/grid`，而是直接把已有 spatial niche 的 `in_niche cell/grid` 当作该 feature 的 binary spatial object：
+
+```text
+                       ┌─ ordinary feature ─ cutoff ─ positive cell/grid ─┐
+feature / gene set ────┤                                                   ├─ Jaccard / ΔJaccard / vector
+                       └─ mapped niche ─────────────── in_niche cell/grid ─┘
+```
+
+也就是说，在后续 SPHERE 计算中：
+
+```text
+in_niche grid  ≡ 原来的 feature-positive grid
+in_niche cell  ≡ 原来的 feature-positive cell
+```
+
+这里的“等价”仅指它们在后续 binary spatial calculation 中扮演相同角色；niche 本身仍然是由 `define_niche()` / `define_niches()` 根据 positive grids + spatial continuity 定义得到的。
+
+### 1.1 新参数：`niche_features`
+
+高层函数现在支持：
+
+```python
+niche_features={
+    "feature_name_1": niche_result_1,
+    "feature_name_2": niche_result_2,
+}
+```
+
+其中 value 必须是 `pysphere.define_niche()` 或 `pysphere.define_niches()` 返回的 `NicheResult`。
+
+支持该参数的主要接口：
+
+```python
+pysphere.spatial_vector()
+pysphere.spatial_vector_x()
+pysphere.pairwise_projected_scores()
+pysphere.kdtree_domain_map()   # experimental KDTree utility
+```
+
+如果 `niche_features=None` 或完全不传，行为与 v0.3.x 一致。
+
+---
+
+## 2. 最常用的新用法
+
+### 2.1 先定义多个 niche
+
+例如已有两个 pathway score：
+
+```python
+niches = pysphere.define_niches(
+    adata,
+    features=["Hypoxia_score", "Inflammation_score"],
+    sample_key="sample_name",
+    grid_size=20,
+    agg="mean",
+    cutoff_method="balanced_global_mean",
+    cutoff_n_repeats=100,
+    cutoff_balance_round_to=1000,
+    cutoff_random_state=666,
+    min_connected_grids=3,
+    connectivity=8,
+)
+
+hypoxia_niche = niches["Hypoxia_score"]
+inflammation_niche = niches["Inflammation_score"]
+```
+
+### 2.2 target 使用 niche，feature 仍使用原来的 positive grid
+
+例如：Hypoxia 使用已经定义好的 niche，而 LDHA 仍然根据自己的表达量和 cutoff 生成 positive grid：
+
+```python
+rs = pysphere.spatial_vector_x(
+    adata,
+    target="Hypoxia_score",
+    features=["LDHA"],
+    sample_key="sample_name",
+    backend="grid",
+    grid_size=20,
+    cutoff_method="balanced_global_mean",
+    niche_features={
+        "Hypoxia_score": hypoxia_niche,
+    },
+)
+```
+
+此时：
+
+```text
+Hypoxia_score → hypoxia_niche.niche_grid → binary target
+LDHA          → cutoff → LDHA-positive grid → binary feature
+```
+
+Hypoxia 不会在 SPHERE 内再次根据 score/cutoff 二值化。
+
+### 2.3 target 和部分 features 都使用 niche
+
+```python
+rs = pysphere.spatial_vector_x(
+    adata,
+    target="Hypoxia_score",
+    features=["Inflammation_score", "LDHA", "VEGFA"],
+    sample_key="sample_name",
+    backend="grid",
+    grid_size=20,
+    cutoff_method="balanced_global_mean",
+    niche_features={
+        "Hypoxia_score": hypoxia_niche,
+        "Inflammation_score": inflammation_niche,
+    },
+)
+```
+
+此时：
+
+```text
+Hypoxia_score       → in_niche grid
+Inflammation_score  → in_niche grid
+LDHA                → positive grid
+VEGFA               → positive grid
+```
+
+它们随后进入同一套 Jaccard / shifted Jaccard / ΔJaccard 计算。
+
+### 2.4 只有某一个 feature 使用 niche
+
+也可以只替换 features 中的一个，而 target 继续按 positive grid：
+
+```python
+rs = pysphere.spatial_vector_x(
+    adata,
+    target="GlycoScore",
+    features=["Hypoxia_score", "Inflammation_score"],
+    sample_key="sample_name",
+    backend="grid",
+    grid_size=20,
+    cutoff_method="balanced_global_mean",
+    niche_features={
+        "Hypoxia_score": hypoxia_niche,
+    },
+)
 ```
 
 ---
 
-## v0.3.0 更新：positive grid + spatial continuity = niche
+## 3. pairwise projected-score matrix 中使用 niche
 
-v0.3.0 在 v0.2.2 的 cohort-wide cutoff 系统上增加了正式的 spatial niche 定义。核心概念是把 **feature-positive grid** 和 **spatially continuous domain** 分开：
+`pairwise_projected_scores()` 同样支持一个或多个 feature 使用 niche 身份。
+
+```python
+pair = pysphere.pairwise_projected_scores(
+    adata,
+    features=[
+        "Hypoxia_score",
+        "Inflammation_score",
+        "GlycoScore",
+        "LDHA",
+    ],
+    sample_key="sample_name",
+    backend="grid",
+    grid_size=20,
+    final_step=12,
+    cutoff_method="balanced_global_mean",
+    niche_features={
+        "Hypoxia_score": hypoxia_niche,
+        "Inflammation_score": inflammation_niche,
+    },
+)
+
+pair.matrix
+pair.sample_scores
+```
+
+对于所有涉及 `Hypoxia_score` 或 `Inflammation_score` 的 pair，都会直接使用对应 `niche_grid`；`GlycoScore` 和 `LDHA` 仍然使用 cutoff-derived positive grid。
+
+因此同一个 pairwise matrix 中可以混合：
+
+```text
+niche vs niche
+niche vs positive
+positive vs niche
+positive vs positive
+```
+
+---
+
+## 4. 输出如何区分 positive 与 niche source
+
+`spatial_vector()` / `spatial_vector_x()` 的 raw vector 表中新增：
+
+```text
+binary_source_target
+binary_source_feature
+n_binary_target
+n_binary_feature
+binary_fraction_target
+binary_fraction_feature
+```
+
+`binary_source_*` 为：
+
+```text
+"positive"  # 普通 cutoff-derived positive cell/grid
+"niche"     # 直接使用 in_niche cell/grid
+```
+
+为了兼容旧代码，原来的：
+
+```text
+n_positive_target
+n_positive_feature
+positive_fraction_target
+positive_fraction_feature
+```
+
+仍然保留。当某个对象来源为 niche 时，这些旧列记录的是**实际参与 SPHERE 的 active binary units**，也就是 in-niche cell/grid 数量；新代码建议优先查看 `n_binary_*` 和 `binary_source_*`。
+
+对于 niche source：
+
+```text
+cutoff_target / cutoff_feature = NaN
+```
+
+因为该对象已经由 niche identity 二值化，不会在 SPHERE 阶段再次计算 cutoff。
+
+结果对象的 `settings` 中还会记录：
+
+```python
+rs.settings["binary_sources"]
+rs.settings["niche_features"]
+rs.settings["backend_status"]
+```
+
+---
+
+## 5. niche 与 SPHERE grid 必须使用相同空间几何
+
+当 `backend="grid"` 且使用 `niche_features` 时，sat4sc 会进行严格检查。
+
+推荐：定义 niche 与后续 SPHERE 使用完全相同的：
+
+```python
+grid_size=20
+min_cells_per_bin=1
+```
+
+并且使用同一个 AnnData / 同一批 cell coordinates。
+
+例如：
+
+```python
+hypoxia_niche = pysphere.define_niche(
+    adata,
+    feature="Hypoxia_score",
+    sample_key="sample_name",
+    grid_size=20,
+    min_cells_per_bin=1,
+    cutoff_method="balanced_global_mean",
+    min_connected_grids=3,
+)
+
+rs = pysphere.spatial_vector_x(
+    adata,
+    target="Hypoxia_score",
+    features=["Inflammation_score"],
+    sample_key="sample_name",
+    backend="grid",
+    grid_size=20,
+    min_cells_per_bin=1,
+    niche_features={"Hypoxia_score": hypoxia_niche},
+)
+```
+
+若 grid size、occupied-grid mask、坐标或样本不一致，会直接报错，而不是静默地把不同空间网格混在一起。
+
+---
+
+## 6. spatial niche 定义
+
+niche 的基本流程仍然是：
 
 ```text
 continuous feature score
@@ -50,28 +328,9 @@ spatial niche
 positive grid ≠ niche
 ```
 
-只有属于足够大的连续 positive-grid component 的 grid 才被标记为 niche。默认参数为：
+只有属于足够大、空间连续的 positive-grid component 的 grid 才成为 niche。
 
-```python
-cutoff_method="balanced_global_mean"
-min_connected_grids=3
-connectivity=8
-```
-
-
-
-当 `connectivity=8` 时，只要另一个positive grid位于它的：
-
-- 上、下、左、右
-- 左上、右上、左下、右下
-
-任意一个方向，就认为两者是相邻、连通的。
-
-
-
-当connectivity=4，连通只认可——上、下、左、右
-
-### 0.3.1 定义一个 niche
+### 6.1 定义一个 niche
 
 ```python
 hypoxia_niche = pysphere.define_niche(
@@ -91,29 +350,7 @@ hypoxia_niche = pysphere.define_niche(
 )
 ```
 
-`hypoxia_niche.summary` 返回每个样本的：
-
-```text
-sample
-feature
-cutoff
-n_occupied_grids
-n_positive_grids
-positive_grid_fraction
-n_niche_grids
-niche_grid_fraction
-n_positive_components
-n_niches
-largest_niche_grids
-n_cells
-n_cells_in_positive_grid
-positive_grid_cell_fraction
-n_niche_cells
-niche_cell_fraction
-niche_area
-```
-
-当 `annotate_obs=True` 时，会直接向 `adata.obs` 写入：
+当 `annotate_obs=True` 时，可以写入类似：
 
 ```python
 adata.obs["hypoxia_positive_grid"]
@@ -121,13 +358,336 @@ adata.obs["hypoxia_niche"]
 adata.obs["hypoxia_niche_id"]
 ```
 
-这里 cell-level niche membership 的定义是：**该 cell 所在的 grid 是否属于 retained niche component**。因此 niche 的定义始终发生在 grid level，而 cell level 是从 grid membership 映射回真实 cell/spot。
+cell-level niche membership 的定义为：该 cell 所在 grid 是否属于 retained niche component。
 
-### 0.3.2 一次定义多个 niche
+### 6.2 4-neighbor 与 8-neighbor
 
-推荐对需要直接比较的多个 pathway 一次计算共享 cohort cutoffs：
+默认：
 
 ```python
+connectivity=8
+```
+
+即上、下、左、右以及四个对角方向均可以连接。
+
+若希望更严格：
+
+```python
+connectivity=4
+```
+
+只允许共享边界的 grid 相连。
+
+### 6.3 niche 结果
+
+```python
+hypoxia_niche.summary
+hypoxia_niche.sample_results["sample01"].positive_grid
+hypoxia_niche.sample_results["sample01"].niche_grid
+hypoxia_niche.sample_results["sample01"].cell_niche
+```
+
+`niche_grid` 和 `cell_niche` 正是 v0.4.0 可以直接送入后续 SPHERE binary calculation 的身份。
+
+---
+
+## 7. cohort-wide cutoff
+
+普通 positive cell/grid 仍可使用 cohort-wide cutoff：
+
+```python
+cutoff_result = pysphere.calculate_cutoffs(
+    adata,
+    features=["Hypoxia_score", "Inflammation_score"],
+    sample_key="sample_name",
+    level="grid",
+    method="balanced_global_mean",
+)
+```
+
+常用方法：
+
+```text
+median_of_sample_medians
+mean_of_sample_means
+balanced_global_median
+balanced_global_mean
+```
+
+在 v0.4.0 中，如果某个 feature 已写入 `niche_features`，SPHERE 阶段会跳过该 feature 的 cutoff 计算；只有未映射的普通 feature 才需要 SPHERE cutoff。
+
+---
+
+## 8. regular-grid SPHERE（推荐）
+
+Xenium / CosMx / MERFISH 等数据通常使用连续 cell centroid 坐标。`backend="grid"` 会先把细胞投影到规则二维 grid，再执行 8 方向位移。
+
+例如：
+
+```python
+grid_size = 20
+steps = (2, 4, 6, 8, 10, 12)
+```
+
+若坐标单位是 μm，对应位移距离为：
+
+```text
+40, 80, 120, 160, 200, 240 μm
+```
+
+### 8.1 单个样本
+
+```python
+rs_grid = pysphere.spatial_vector(
+    adata,
+    sample="sample01",
+    sample_key="sample_name",
+    target="Hypoxia_score",
+    features=["Inflammation_score", "GlycoScore", "LDHA"],
+    backend="grid",
+    grid_size=20,
+    steps=(2, 4, 6, 8, 10, 12),
+)
+```
+
+### 8.2 多样本
+
+```python
+rs_grid = pysphere.spatial_vector_x(
+    adata,
+    target="Hypoxia_score",
+    features=["Inflammation_score", "GlycoScore", "LDHA"],
+    sample_key="sample_name",
+    backend="grid",
+    grid_size=20,
+)
+```
+
+关键输出：
+
+```python
+rs_grid.vectors
+rs_grid.projected_score
+rs_grid.vector_len
+rs_grid.pool_raw
+rs_grid.sample_projected_score
+rs_grid.sample_vector_len
+```
+
+---
+
+## 9. SPHERE 的共同统计量
+
+固定对象 A，将对象 B 沿 8 个方向移动，在每个 step 计算：
+
+```text
+ΔJaccard = Jaccard(A, shifted B) - Jaccard(A, original B)
+```
+
+每个 step 保留：
+
+```text
+min ΔJaccard
+max ΔJaccard
+```
+
+最终 step：
+
+```text
+projected_score = (min ΔJaccard + max ΔJaccard) / 2
+```
+
+同时计算 vector-path magnitude。
+
+无论 binary object 来源是：
+
+```text
+positive grid/cell
+```
+
+还是：
+
+```text
+in_niche grid/cell
+```
+
+进入 binary object 以后，后面的 Jaccard / ΔJaccard / projected score / magnitude 计算完全共用同一套逻辑。
+
+---
+
+## 10. KDTree backend：实验性功能
+
+`backend="kdtree"` 保留连续 cell coordinates，并把 active cells（普通 positive cells 或 v0.4.0 的 in-niche cells）扩展为 radius-defined occupancy domain，再做空间位移和 Jaccard 计算。
+
+简要示例：
+
+```python
+rs_kdtree = pysphere.spatial_vector_x(
+    adata,
+    target="Hypoxia_score",
+    features=["Inflammation_score"],
+    backend="kdtree",
+    radius=15,
+    niche_features={
+        "Hypoxia_score": hypoxia_niche,
+    },
+)
+```
+
+在此模式下：
+
+```text
+普通 feature → positive cells → KDTree radius domain
+niche feature → in_niche cells → KDTree radius domain
+```
+
+**注意：KDTree backend 在 v0.4.0 中属于实验性功能。对于正式、常规和需要稳定比较的分析，建议优先使用 `backend="grid"`。**
+
+---
+
+## 11. 输入 AnnData
+
+典型输入：
+
+```python
+adata
+# obs: ..., 'x_centroid', 'y_centroid', 'sample_name', ...
+# layers: 'counts', ...
+```
+
+默认优先读取：
+
+```python
+coord_cols=("x_centroid", "y_centroid")
+```
+
+如果不存在，则可使用：
+
+```python
+adata.obsm["spatial"]
+```
+
+`target` / `features` 可以是：
+
+```text
+1. adata.obs 中的连续数值列，例如 pathway score
+2. adata.var_names 中的单基因
+3. adata.obs 中人为创建的 0/1 数值列
+4. v0.4.0 中映射到 NicheResult 的 feature 名
+```
+
+当一个 feature 被 `niche_features` 映射后，即使后续 SPHERE 不需要它的原始连续数值，也仍建议 mapping key 与生成该 niche 时的 feature 名保持一致，便于结果追踪。
+
+---
+
+## 12. 安装
+
+在仓库根目录：
+
+```bash
+pip install -e .
+```
+
+然后：
+
+```python
+from sat4sc import pysphere, pysphere_plotting
+print(__import__("sat4sc").__version__)
+# 0.4.0
+```
+
+依赖：
+
+```text
+numpy >= 1.24
+pandas >= 2.0
+scipy >= 1.10
+anndata >= 0.10
+matplotlib >= 3.7
+```
+
+---
+
+## 13. 主要函数概览
+
+### SPHERE / spatial calculation
+
+```python
+pysphere.spatial_adjust()
+pysphere.spatial_binstat()
+pysphere.spatial_cordstat()
+pysphere.spatial_vector()
+pysphere.spatial_vector_x()
+pysphere.pairwise_projected_scores()
+pysphere.spatial_vec_proj()
+pysphere.spatial_vec_magnitude()
+```
+
+### niche / cutoff
+
+```python
+pysphere.calculate_cutoffs()
+pysphere.positive_proportions()
+pysphere.define_niche()
+pysphere.define_niches()
+```
+
+### spatial maps / utilities
+
+```python
+pysphere.grid_feature_map()
+pysphere.kdtree_domain_map()   # experimental
+pysphere.add_module_scores()
+```
+
+### plotting
+
+```python
+from sat4sc import pysphere_plotting
+```
+
+包括 grid feature map、binary overlay、niche overlay、niche + positive feature、niche + continuous feature，以及 SPHERE vector / projected-score 等绘图接口。
+
+---
+
+## 14. v0.4.0 向后兼容性
+
+旧代码：
+
+```python
+rs = pysphere.spatial_vector_x(
+    adata,
+    target="Hypoxia_score",
+    features=["Inflammation_score"],
+    backend="grid",
+    grid_size=20,
+)
+```
+
+无需修改，仍然使用：
+
+```text
+Hypoxia-positive grid vs Inflammation-positive grid
+```
+
+只有显式加入：
+
+```python
+niche_features={...}
+```
+
+时，相应 feature 才会切换到 `in_niche` 身份。
+
+因此 v0.4.0 可以在同一分析中自由混合 legacy positive object 与 niche object，而不会改变未指定 feature 的旧行为。
+
+---
+
+## 15. 推荐 workflow
+
+```python
+from sat4sc import pysphere, pysphere_plotting
+
+# 1. 为需要“空间连续 niche”身份的 pathway 定义 niche
 niches = pysphere.define_niches(
     adata,
     features=["Hypoxia_score", "Inflammation_score"],
@@ -138,1712 +698,39 @@ niches = pysphere.define_niches(
     connectivity=8,
 )
 
-hypoxia_niche = niches["Hypoxia_score"]
-inflammation_niche = niches["Inflammation_score"]
-```
-
-### 0.3.3 可视化 I：niche + niche
-
-四种状态使用不同颜色：
-
-```text
-Other
-Niche 1 only
-Niche 2 only
-Overlap
-```
-
-Grid-level：
-
-```python
-fig, ax, info = pysphere_plotting.plot_niche_overlay(
-    hypoxia_niche,
-    inflammation_niche,
-    sample="sample01",
-    space="grid",
-)
-```
-
-Cell-level：
-
-```python
-fig, ax, info = pysphere_plotting.plot_niche_overlay(
-    hypoxia_niche,
-    inflammation_niche,
-    sample="sample01",
-    space="cell",
-    point_size=3,
-)
-```
-
-### 0.3.4 可视化 II：niche + another feature positive
-
-例如查看 Hypoxia niche 与 LDHA-positive 的空间关系。Grid-level 时 LDHA positivity 基于 grid-level cutoff；cell-level 时基于 cell-level cutoff：
-
-```python
-fig, ax, info = pysphere_plotting.plot_niche_positive_overlay(
-    hypoxia_niche,
-    adata,
-    feature="LDHA",
-    sample="sample01",
-    space="grid",
-    cutoff_method="balanced_global_mean",
-)
-```
-
-```python
-fig, ax, info = pysphere_plotting.plot_niche_positive_overlay(
-    hypoxia_niche,
-    adata,
-    feature="LDHA",
-    sample="sample01",
-    space="cell",
-    cutoff_method="balanced_global_mean",
-    point_size=3,
-)
-```
-
-输出同样分成：
-
-```text
-Other
-Niche only
-Feature-positive only
-Overlap
-```
-
-可以通过 `cohort_cutoffs=` 直接复用 `calculate_cutoffs()` 产生的 `CutoffResult`，避免重复执行 balanced sampling。
-
-### 0.3.5 可视化 III：niche + continuous feature
-
-对于连续表达量/通路分数，不再额外二值化。
-
-Cell-level 默认编码方式：
-
-```text
-face color = continuous feature value
-black edge = cell resides in niche
-```
-
-```python
-fig, ax, info = pysphere_plotting.plot_niche_continuous_feature(
-    hypoxia_niche,
-    adata,
-    feature="LDHA",
-    sample="sample01",
-    space="cell",
-    cmap="viridis",
-    point_size=3,
-    niche_edge_color="black",
-)
-```
-
-Grid-level 默认编码方式：
-
-```text
-grid fill color = continuous grid-level feature value
-black outer boundary = retained niche domain
-```
-
-```python
-fig, ax, info = pysphere_plotting.plot_niche_continuous_feature(
-    hypoxia_niche,
-    adata,
-    feature="LDHA",
-    sample="sample01",
-    space="grid",
-    cmap="viridis",
-)
-```
-
-连续颜色默认使用样本内 finite values 的 1st–99th percentile 作为显示范围，避免少数极端值压缩色阶；这只影响可视化，不影响真实数值或 niche 定义。若希望显示完整范围：
-
-```python
-color_quantiles=None
-```
-
-也可以手动指定：
-
-```python
-vmin=0
-vmax=2
-```
-
-### 0.3.6 4-neighbor vs 8-neighbor
-
-默认：
-
-```python
-connectivity=8
-```
-
-允许横向、纵向以及对角相邻 grid 属于同一个 component。若希望定义更严格的连续性：
-
-```python
-connectivity=4
-```
-
-只允许共享边界的 grid 相连。
-
-`min_connected_grids` 的单位是 grid 数量。例如：
-
-```python
-grid_size=20
-min_connected_grids=3
-```
-
-意味着一个 retained niche 至少包含 3 个 20 × 20 coordinate-unit grids；若坐标单位为 μm，则最小 nominal grid area 为 1,200 μm²。实际 tissue-covered area 仍取决于 occupied grid 的组织覆盖情况。
-
-### 0.3.7 推荐的分析层级
-
-```text
-continuous pathway score
-        ↓
-cohort-wide cutoff
-        ↓
-positive-grid abundance
-        ↓
-connected-component filtering
-        ↓
-niche abundance / niche area / niche cell fraction
-        ↓
-SPHERE relationship analysis / downstream spatial biology
-```
-
-因此可以同时保留两类指标：
-
-```text
-positive_grid_fraction     # pathway-high spatial abundance
-niche_grid_fraction        # spatially organized pathway-high abundance
-n_niches                   # number of disconnected niche domains
-largest_niche_grids        # size of largest niche
-niche_cell_fraction        # fraction of cells residing in niche
-```
-
----
-
-## v0.2.2 更新：cohort-wide cutoff system
-
-v0.2.2 新增统一的 cohort-level cutoff 计算，使不同样本的 `positive cell` / `positive grid` 使用同一把尺子，从而可以直接比较不同样本或样本组的 positive proportion。原 SPHERE-style 的 sample-specific mean 仍保留为默认行为，因此旧分析不会被改变。
-
-核心函数：
-
-```python
-cutoff_result = pysphere.calculate_cutoffs(
-    adata,
-    features=["Hypoxia_score", "Inflammation_score"],
-    sample_key="sample_name",
-    level="cell",   # 或 "grid"
-    method="balanced_global_median",
-)
-
-cutoff_result.cutoffs
-cutoff_result.sample_stats
-cutoff_result.replicate_cutoffs
-```
-
-支持四种 cohort-wide cutoff：
-
-```text
-median_of_sample_medians
-mean_of_sample_means
-balanced_global_median
-balanced_global_mean
-```
-
-其中 balanced 方法默认对每个样本随机抽取相同数量的单位：以最小样本的单位数为上限，并向下取整到 1000 的整数倍，例如 12,345 -> 12,000；默认重复 100 次。`level="cell"` 时单位是 cell/spot；`level="grid"` 时单位是 occupied finite grid。若最小样本少于 1000 个单位，则直接使用其实际单位数，避免向下取整为 0。
-
-这些 cutoff 已直接接入：
-
-```text
-grid_feature_map()
-kdtree_domain_map()
-spatial_vector()
-spatial_vector_x()
-pairwise_projected_scores()
-plot_binary_overlay()
-```
-
-并且低层接口 `spatial_binstat()`、`spatial_cordstat()`、`plot_spatial_overlap()` 可以直接接收 `CutoffResult` 或 feature-keyed cutoff mapping。
-
-例如让整个 cohort 的 grid-SPHERE 使用同一组 `balanced_global_median` cutoff：
-
-```python
+# 2. SPHERE：指定哪些对象使用 niche；其他对象继续按 positive grid
 rs = pysphere.spatial_vector_x(
     adata,
     target="Hypoxia_score",
-    features=["Inflammation_score"],
-    backend="grid",
-    grid_size=20,
-    cutoff_method="balanced_global_median",
-    cutoff_n_repeats=100,
-    cutoff_balance_round_to=1000,
-    cutoff_random_state=666,
-)
-```
-
-直接得到每个样本的 positive proportion：
-
-```python
-positive_df = pysphere.positive_proportions(
-    adata,
-    features=["Hypoxia_score", "Inflammation_score"],
-    level="grid",
-    cutoff_method="balanced_global_median",
-    grid_size=20,
-)
-
-# sample | feature | cutoff | n_units | n_positive | positive_fraction
-```
-
----
-
-## 2. v0.2.1 更新
-
-本版本在 v0.2.0 基础上更新绘图接口：
-
-1. 原 `plotting.py` **改名为** `pysphere_plotting.py`；原有绘图函数逻辑保持不变。
-2. 新增高层接口：
-
-```python
-pysphere_plotting.plot_binary_overlay()
-```
-
-它直接接受 `AnnData + feature names + sample`，并支持：
-
-```python
-space="cell"
-space="grid"
-```
-
-用于绘制类似论文 Figure 3D / 3G 的两个 binary spatial objects 的空间叠加。
-3. 为减少旧代码迁移成本，包级别暂时保留：
-
-```python
-from sat4sc import plotting
-```
-
-作为 `pysphere_plotting` 的兼容别名；新代码建议统一使用：
-
-```python
-from sat4sc import pysphere, pysphere_plotting
-```
-
----
-
-## 3. 三个 spatial plotting 函数的区别
-
-| 函数 | 输入层级 | feature 数量 | 连续/二值 | 空间单位 | 主要用途 |
-|---|---|---:|---|---|---|
-| `plot_grid_feature_map()` | `GridFeatureMap` | 1 | 连续值为主 | grid | 查看 grid-SPHERE 实际看到的某个基因/通路 score；类似 Figure 3C 的逻辑 |
-| `plot_spatial_overlap()` | 两个 `SpatialAdjusted` | 2 | 二值 | 原始 cell/spot | 低层接口；按 cutoff 将两个 feature 二值化后叠加；类似 Figure 3D/G |
-| `plot_binary_overlay()` | `AnnData` + 两个 feature 名 | 2 | 二值 | `cell` 或 `grid` | 高层一步式接口；可直接选择真实细胞空间或 grid-SPHERE 空间 |
-
-三者可以简单理解为：
-
-```text
-plot_grid_feature_map()
-    一个 feature + 连续 score + grid
-
-plot_spatial_overlap()
-    两个 feature + binary + 原始 coordinates + 低层接口
-
-plot_binary_overlay()
-    两个 feature + binary + cell/grid 可选 + AnnData 高层接口
-```
-
-### 3.1 `plot_grid_feature_map()`：单个 feature 的连续 grid map
-
-先生成与 grid-SPHERE 完全相同的 rasterized map：
-
-```python
-grid_map = pysphere.grid_feature_map(
-    adata,
-    feature="Hypoxia_score",
-    sample="sample01",
-    sample_key="sample_name",
-    grid_size=20,
-    agg="mean",
-)
-```
-
-再绘图：
-
-```python
-fig, ax = pysphere_plotting.plot_grid_feature_map(
-    grid_map,
-    cmap="viridis",
-    show_positive_outline=True,
-)
-```
-
-这里颜色表示每个 grid 的连续 `Hypoxia_score`；`show_positive_outline=True` 只额外标出超过 `grid_map.cutoff` 的 high-feature domain。
-
-### 3.2 `plot_spatial_overlap()`：低层 cell/spot binary overlay
-
-先分别构建两个 `SpatialAdjusted`：
-
-```python
-hypoxia = pysphere.spatial_adjust(
-    adata,
-    feature="Hypoxia_score",
-    sample="sample01",
-)
-
-mes1 = pysphere.spatial_adjust(
-    adata,
-    feature="MES1_score",
-    sample="sample01",
-)
-```
-
-再叠加：
-
-```python
-fig, ax = pysphere_plotting.plot_spatial_overlap(
-    hypoxia,
-    mes1,
-    cutoffs=None,
-    colors=("#F2D28B", "#707070"),
-)
-```
-
-`cutoffs=None` 时，两个 feature 都使用各自有限值的均值作为 cutoff。feature 1 为实心点，feature 2 为空心圈。该函数保留为接近原 SPHERE `spatial_cordstat(..., plot_bin=TRUE)` 的低层接口。
-
-### 3.3 `plot_binary_overlay(space="cell")`：一步式 cell-level overlay
-
-```python
-fig, ax, info = pysphere_plotting.plot_binary_overlay(
-    adata,
-    feature1="Hypoxia_score",
-    feature2="MES1_score",
-    sample="sample01",
-    sample_key="sample_name",
-    space="cell",
-    cutoff1="mean",
-    cutoff2="mean",
-    colors=("#F2D28B", "#707070"),
-)
-```
-
-绘图逻辑：
-
-```text
-所有细胞         浅灰背景
-feature1+        实心
-feature2+        空心轮廓
-overlap           feature1 实心上叠 feature2 轮廓
-```
-
-`info` 会返回实际 cutoff 以及 positive/overlap 数量：
-
-```python
-info
-# {
-#   "space": "cell",
-#   "cutoff1": ...,
-#   "cutoff2": ...,
-#   "n_feature1_positive": ...,
-#   "n_feature2_positive": ...,
-#   "n_overlap": ...,
-# }
-```
-
-### 3.4 `plot_binary_overlay(space="grid")`：一步式 grid-level overlay
-
-```python
-fig, ax, info = pysphere_plotting.plot_binary_overlay(
-    adata,
-    feature1="Hypoxia_score",
-    feature2="MES1_score",
-    sample="sample01",
-    sample_key="sample_name",
-    space="grid",
-    grid_size=20,
-    agg="mean",
-    cutoff1="mean",
-    cutoff2="mean",
-)
-```
-
-这里先把两个 feature rasterize 到同一套等面积 grid，再做 binary overlay。因此它展示的是 **grid-SPHERE 真正使用的空间单位**，适合检查进入 Jaccard / ΔJaccard 计算的 spatial objects。
-
-### 3.5 `plot_binary_overlay()` 的 cutoff
-
-`cutoff1` / `cutoff2` 继续支持 legacy/local cutoff：
-
-```python
-"mean"                 # 默认；SPHERE-style
-"median"
-"zero"
-0.25                   # 显式数值
-("quantile", 0.90)     # 90% quantile
-```
-
-例如：
-
-```python
-fig, ax, info = pysphere_plotting.plot_binary_overlay(
-    adata,
-    feature1="Hypoxia_score",
-    feature2="HIF1A",
-    sample="sample01",
-    space="cell",
-    cutoff1=("quantile", 0.8),
-    cutoff2="zero",
-)
-```
-
-从 v0.2.2 起，也可以直接使用 cohort-wide cutoff：
-
-```python
-fig, ax, info = pysphere_plotting.plot_binary_overlay(
-    adata,
-    feature1="Hypoxia_score",
-    feature2="MES1_score",
-    sample="sample01",
-    space="grid",
-    grid_size=20,
-    cutoff_method="balanced_global_median",
-)
-```
-
-详见第 16 节。
-
----
-
-## 4. v0.2.0 功能回顾
-
-相较 v0.1.0，本版本新增两部分。
-
-### 4.1 KDTree backend
-
-直接保留连续细胞坐标，不先做规则网格。算法流程为：
-
-```text
-cell coordinates
-      ↓
-feature threshold
-      ↓
-positive cells
-      ↓
-cKDTree radius-defined occupancy on fixed cell anchors
-      ↓
-fix target A
-      ↓
-virtually shift feature B in 8 directions
-      ↓
-re-project shifted B onto fixed anchors by KDTree radius matching
-      ↓
-Jaccard
-      ↓
-ΔJaccard
-      ↓
-min/max ΔJaccard → projected score / magnitude
-```
-
-该 backend 是 **cell-resolved SPHERE extension**，不是把原 Visium lattice 的“精确坐标匹配”机械搬到 Xenium。
-
-### 4.2 Grid 后的空间可视化
-
-新增：
-
-```python
-pysphere.grid_feature_map()
-pysphere_plotting.plot_grid_feature_map()
-```
-
-可以直接查看某个基因或通路分数在 **SPHERE 实际使用的 rasterized grid** 上是什么空间分布，并可叠加二值化阈值轮廓。
-
-这非常适合在正式计算 SPHERE 前检查：
-
-- `grid_size` 是否过粗或过细；
-- 某个 pathway score 是否形成合理空间结构；
-- mean / quantile cutoff 后形成的 positive domain 是否符合预期。
-
----
-
-## 5. 安装
-
-在仓库根目录：
-
-```bash
-pip install -e .
-```
-
-之后：
-
-```python
-from sat4sc import pysphere, pysphere_plotting
-```
-
-依赖：
-
-- `numpy`
-- `pandas`
-- `scipy`
-- `anndata`
-- `matplotlib`
-
----
-
-# 6. 输入 AnnData
-
-例如：
-
-```python
-adata
-# AnnData object with n_obs × n_vars = 506604 × 5001
-# obs: ..., 'x_centroid', 'y_centroid', 'sample_name', 'sample_group', ...
-# obsm: 'spatial', ...
-# layers: 'counts'
-```
-
-默认优先读取：
-
-```python
-coord_cols=("x_centroid", "y_centroid")
-```
-
-如果这两列不存在，则尝试：
-
-```python
-adata.obsm["spatial"]
-```
-
-`target` / `features` 可以是：
-
-1. `adata.obs` 中的数值列，例如：
-
-```python
-"Hypoxia_score"
-"Inflammation_score"
-"GlycoScore"
-```
-
-2. `adata.var_names` 中的单基因，例如：
-
-```python
-"HIF1A"
-"EPAS1"
-"LDHA"
-```
-
-3. 离散细胞类型转成的 0/1 列：
-
-```python
-adata.obs["BMDM"] = (adata.obs["sub_cell_type"] == "BMDM").astype(float)
-```
-
----
-
-# 7. SPHERE 的共同数学框架
-
-两种 backend 最终都保留同一套 SPHERE 核心统计量。
-
-固定对象 A，将对象 B 沿 8 个方向移动，在每个 step 计算：
-
-```text
-ΔJaccard = Jaccard(A, shifted B) - Jaccard(A, original B)
-```
-
-每个 step 取：
-
-```text
-min ΔJaccard
-max ΔJaccard
-```
-
-最终 step 的 projected score：
-
-```text
-projected_score = (min ΔJaccard + max ΔJaccard) / 2
-```
-
-解释：
-
-- projected score 越负：B 越倾向原本位于 A 内部/靠近 A；
-- `projected_score < 0`：可作为论文 Figure 4B 一类的共定位方向判定；
-- `max ΔJaccard < 0`：更严格的 Q3 / core-like 关系；
-- magnitude：从原点经过各 step vector 的累计路径长度。
-
-本包默认保留原实现的一个细节：Jaccard 可先四舍五入到 4 位再计算 ΔJaccard：
-
-```python
-round_jaccard=4
-```
-
----
-
-# 8. Backend 1：regular grid
-
-## 8.1 原理
-
-Xenium 坐标是连续值：
-
-```text
-x_centroid
- y_centroid
-```
-
-`backend="grid"` 首先把细胞投影到规则二维 grid，然后再做 8 方向位移。
-
-例如：
-
-```python
-grid_size = 20
-steps = (2, 4, 6, 8, 10, 12)
-```
-
-如果坐标单位是 μm，则对应真实位移：
-
-```text
-40, 80, 120, 160, 200, 240 μm
-```
-
-该 backend 的优势是每个空间单元面积相同，因此更接近原 Visium SPHERE 的空间面积逻辑。
-
----
-
-## 8.2 单个样本
-
-```python
-rs_grid = pysphere.spatial_vector(
-    adata,
-    sample="sample01",
-    sample_key="sample_name",
-    target="Hypoxia_score",
-    features=["Inflammation_score", "GlycoScore", "BMDM"],
-    backend="grid",
-    grid_size=20,
-    steps=(2, 4, 6, 8, 10, 12),
-)
-```
-
-结果：
-
-```python
-rs_grid.vectors
-rs_grid.projected_score
-rs_grid.vector_len
-```
-
----
-
-## 8.3 多样本
-
-```python
-rs_grid = pysphere.spatial_vector_x(
-    adata,
-    target="Hypoxia_score",
-    features=["Inflammation_score", "GlycoScore", "BMDM"],
+    features=["Inflammation_score", "GlycoScore", "LDHA"],
     sample_key="sample_name",
     backend="grid",
     grid_size=20,
+    cutoff_method="balanced_global_mean",
+    niche_features={
+        "Hypoxia_score": niches["Hypoxia_score"],
+        "Inflammation_score": niches["Inflammation_score"],
+    },
 )
+
+# 3. 检查实际 binary source
+print(rs.settings["binary_sources"])
+print(rs.pool_raw[[
+    "sample", "feature",
+    "binary_source_target", "binary_source_feature",
+    "n_binary_target", "n_binary_feature",
+    "min_djaccard", "max_djaccard",
+]].head())
+
+# 4. downstream
+print(rs.projected_score)
+print(rs.sample_projected_score)
 ```
 
-关键输出：
-
-```python
-# cohort-level average vector
-rs_grid.vectors
-
-# cohort-level projected score
-rs_grid.projected_score
-
-# 每个 sample × feature 的 projected score
-rs_grid.sample_projected_score
-
-# 每个 sample × feature 的 magnitude
-rs_grid.sample_vector_len
-```
+这也是 v0.4.0 最推荐的 niche-aware SPHERE 使用方式。
 
 ---
 
-# 9. Grid 后的基因/通路 spatial map
+## License / attribution
 
-## 9.1 生成 rasterized feature map
-
-例如查看某个样本的 Hypoxia score 在 `20 μm` grid 上的空间分布：
-
-```python
-grid_map = pysphere.grid_feature_map(
-    adata,
-    feature="Hypoxia_score",
-    sample="sample01",
-    sample_key="sample_name",
-    grid_size=20,
-    agg="mean",
-)
-```
-
-返回：
-
-```python
-grid_map.grid       # 每个 grid 的 feature score
-grid_map.occupied   # 哪些 grid 有足够细胞
-grid_map.counts     # 每个 grid 的细胞数
-grid_map.x_edges
-grid_map.y_edges
-grid_map.cutoff     # 默认 occupied grid 的 mean
-```
-
----
-
-## 9.2 绘图
-
-```python
-fig, ax = pysphere_plotting.plot_grid_feature_map(
-    grid_map,
-    cmap="viridis",
-    show_positive_outline=True,
-)
-
-fig.savefig("Hypoxia_grid_spatial.png", dpi=600, bbox_inches="tight")
-fig.savefig("Hypoxia_grid_spatial.pdf", bbox_inches="tight")
-```
-
-`show_positive_outline=True` 会按照当前 cutoff 画出 high-score domain 的轮廓。
-
----
-
-## 9.3 使用自定义 cutoff
-
-直接指定数值：
-
-```python
-grid_map = pysphere.grid_feature_map(
-    adata,
-    feature="Hypoxia_score",
-    sample="sample01",
-    grid_size=20,
-    cutoff=0.12,
-)
-```
-
-或使用分位数：
-
-```python
-grid_map = pysphere.grid_feature_map(
-    adata,
-    feature="Hypoxia_score",
-    sample="sample01",
-    grid_size=20,
-    quantile_cutoff=0.75,
-)
-```
-
-注意：这里的 cutoff 主要用于 spatial map 上的 binary outline。实际 SPHERE 计算中的 cutoff 仍由 `spatial_vector()` / `spatial_vector_x()` 的 `cutoffs` 或 `quantile_cutoffs` 参数控制。
-
----
-
-# 10. Backend 2：KDTree cell-resolved SPHERE
-
-## 10.1 核心定义
-
-KDTree backend 不构建完整 cell-cell distance matrix。
-
-而是：
-
-```python
-from scipy.spatial import cKDTree
-```
-
-利用空间索引查询 radius neighborhood。
-
-假设 feature A 的阳性细胞坐标为：
-
-```text
-A-positive cells
-```
-
-对于每一个真实 cell anchor，若距离任一 A-positive cell 不超过 `radius`：
-
-```text
-A_domain = True
-```
-
-feature B 同理。
-
-然后固定 A，将 B 的阳性坐标虚拟平移，再重新投影到同一批固定 cell anchors，计算 Jaccard。
-
-因此 KDTree backend 的空间单位是：
-
-> **radius-defined occupancy on real cell anchors**
-
-而不是规则等面积 grid。
-
----
-
-## 10.2 推荐参数含义
-
-```python
-radius = 15
-steps = (25, 50, 75, 100, 125, 150)
-```
-
-若坐标单位为 μm：
-
-- `radius=15`：一个阳性细胞影响附近 15 μm 内的 anchor；
-- `step=50`：将 feature B 虚拟移动 50 μm。
-
-两者不要混淆。
-
----
-
-## 10.3 单样本 KDTree SPHERE
-
-```python
-rs_kd = pysphere.spatial_vector(
-    adata,
-    sample="sample01",
-    sample_key="sample_name",
-    target="Hypoxia_score",
-    features=["Inflammation_score", "GlycoScore", "BMDM"],
-    backend="kdtree",
-    radius=15,
-    steps=(25, 50, 75, 100, 125, 150),
-    direction_mode="sphere",
-    min_coverage=0.7,
-    workers=-1,
-)
-```
-
-也可以使用快捷函数：
-
-```python
-rs_kd = pysphere.spatial_vector_kdtree(
-    adata,
-    sample="sample01",
-    target="Hypoxia_score",
-    features=["Inflammation_score"],
-    radius=15,
-    steps=(25, 50, 75, 100, 125, 150),
-)
-```
-
----
-
-## 10.4 多样本 KDTree SPHERE
-
-```python
-rs_kd = pysphere.spatial_vector_x(
-    adata,
-    target="Hypoxia_score",
-    features=["Inflammation_score", "GlycoScore", "BMDM"],
-    sample_key="sample_name",
-    backend="kdtree",
-    radius=15,
-    steps=(25, 50, 75, 100, 125, 150),
-    workers=-1,
-)
-```
-
-快捷形式：
-
-```python
-rs_kd = pysphere.spatial_vector_x_kdtree(
-    adata,
-    target="Hypoxia_score",
-    features=["Inflammation_score"],
-    sample_key="sample_name",
-    radius=15,
-)
-```
-
-若 `steps` 省略，KDTree backend 默认：
-
-```python
-(25, 50, 75, 100, 125, 150)
-```
-
----
-
-## 10.5 `direction_mode`
-
-### 与原 SPHERE 一致
-
-```python
-direction_mode="sphere"
-```
-
-对角方向：
-
-```text
-(step, step)
-```
-
-因此对角真实欧氏位移为：
-
-```text
-sqrt(2) × step
-```
-
-### 等欧氏距离模式
-
-```python
-direction_mode="euclidean"
-```
-
-对角方向自动使用：
-
-```text
-(step/√2, step/√2)
-```
-
-使 8 个方向的欧氏移动距离全部等于 `step`。
-
-若目的是尽可能贴近原 SPHERE，建议：
-
-```python
-direction_mode="sphere"
-```
-
----
-
-## 10.6 组织边界 coverage
-
-KDTree backend 会计算每个方向虚拟平移后，feature-positive cells 仍能匹配到真实组织 anchor 的比例：
-
-```text
-coverage_fraction
-```
-
-可以设置：
-
-```python
-min_coverage=0.7
-```
-
-低于该值的方向不参与该 step 的 min/max ΔJaccard。
-
-每个 sample × feature × step 的结果中还会保存：
-
-```python
-min_direction_coverage
-mean_direction_coverage
-```
-
-如果希望完全不过滤：
-
-```python
-min_coverage=0
-```
-
----
-
-# 11. KDTree domain spatial visualization
-
-可以直接查看 KDTree backend 实际使用的 target / feature occupancy domain。
-
-## 11.1 原始状态
-
-```python
-kd_map = pysphere.kdtree_domain_map(
-    adata,
-    target="Hypoxia_score",
-    feature="Inflammation_score",
-    sample="sample01",
-    radius=15,
-)
-
-fig, ax = pysphere_plotting.plot_kdtree_domain_map(
-    kd_map,
-    point_size=3,
-)
-```
-
-图中区分：
-
-- target-only anchors；
-- feature-only anchors；
-- overlap anchors；
-- background anchors。
-
----
-
-## 11.2 查看虚拟平移后的 B domain
-
-例如把 inflammation 向左移动 50 μm：
-
-```python
-kd_shift = pysphere.kdtree_domain_map(
-    adata,
-    target="Hypoxia_score",
-    feature="Inflammation_score",
-    sample="sample01",
-    radius=15,
-    shift=(-50, 0),
-)
-
-fig, ax = pysphere_plotting.plot_kdtree_domain_map(
-    kd_shift,
-    show_positive_cells=True,
-)
-```
-
-标题会同时显示：
-
-```text
-radius
-shift
-sample
-coverage_fraction
-```
-
-这可以非常直观地检查 SPHERE “移动 B 后与 A 更重叠还是更分离”的几何逻辑。
-
----
-
-# 12. Figure 3B 风格 vector plot：两种 backend 通用
-
-Grid：
-
-```python
-fig, ax = pysphere_plotting.plot_vector(rs_grid)
-```
-
-KDTree：
-
-```python
-fig, ax = pysphere_plotting.plot_vector(rs_kd)
-```
-
-KDTree 图中的 step colorbar 会标记为：
-
-```text
-step (coordinate units)
-```
-
-Grid 则为：
-
-```text
-step (grid cells)
-```
-
----
-
-# 13. Figure 3A：pairwise projected-score heatmap
-
-## 13.1 Grid
-
-```python
-features = [
-    "AC", "Hypoxia_score", "MES1", "MES2", "BMDM",
-    "Endothelial", "Pericyte", "NPC2", "T_NK",
-    "Microglia", "Oligodendrocyte", "OPC", "NPC1"
-]
-
-pair_grid = pysphere.pairwise_projected_scores(
-    adata,
-    features=features,
-    sample_key="sample_name",
-    backend="grid",
-    grid_size=20,
-    final_step=12,
-)
-
-fig, ax = pysphere_plotting.plot_projected_heatmap(
-    pair_grid,
-    order=features,
-    triangle="lower",
-)
-```
-
-## 13.2 KDTree
-
-```python
-pair_kd = pysphere.pairwise_projected_scores(
-    adata,
-    features=features,
-    sample_key="sample_name",
-    backend="kdtree",
-    radius=15,
-    final_step=150,
-    workers=-1,
-)
-
-fig, ax = pysphere_plotting.plot_projected_heatmap(
-    pair_kd,
-    order=features,
-    triangle="lower",
-)
-```
-
-KDTree pairwise 模式会缓存每个 feature 在最终 step 的 8 个 shifted domain，再对不同 target 重用，以减少重复 KDTree 查询。
-
----
-
-# 14. Figure 3F：paired projected score
-
-无论 grid 还是 KDTree，只要使用 cohort-level `spatial_vector_x()`，都可直接画：
-
-```python
-rs_hif = pysphere.spatial_vector_x(
-    adata,
-    target="malignant",
-    features=["HIF1A", "EPAS1", "HIF3A"],
-    sample_key="sample_name",
-    backend="kdtree",
-    radius=15,
-    steps=(25, 50, 75, 100, 125, 150),
-)
-
-fig, ax, stat = pysphere_plotting.plot_paired_projected_scores(
-    rs_hif,
-    feature_a="HIF1A",
-    feature_b="EPAS1",
-)
-```
-
-统计使用：
-
-```text
-paired Wilcoxon
-```
-
----
-
-# 15. Figure 4B：Hypoxia–Inflammation 共定位
-
-## Grid
-
-```python
-rs_hi_grid = pysphere.spatial_vector_x(
-    adata,
-    target="Hypoxia_score",
-    features=["Inflammation_score"],
-    backend="grid",
-    grid_size=20,
-)
-```
-
-## KDTree
-
-```python
-rs_hi_kd = pysphere.spatial_vector_x(
-    adata,
-    target="Hypoxia_score",
-    features=["Inflammation_score"],
-    backend="kdtree",
-    radius=15,
-    steps=(25, 50, 75, 100, 125, 150),
-)
-```
-
-两者都使用相同绘图函数：
-
-```python
-fig, ax, stat = pysphere_plotting.plot_colocalization_distribution(
-    rs_hi_kd,
-    feature="Inflammation_score",
-    threshold=0,
-)
-```
-
-判定：
-
-```python
-projected_score < 0
-```
-
-输出：
-
-```python
-stat
-# n
-# n_colocalized
-# percent_colocalized
-# pvalue
-# threshold
-```
-
----
-
-# 16. cutoff 如何定义
-
-v0.2.2 将 cutoff 分成两类：**legacy sample-specific cutoff** 和 **cohort-wide shared cutoff**。
-
-## 16.1 Legacy SPHERE-style cutoff
-
-如果不指定 `cutoff_method`，行为与旧版本一致。
-
-Grid backend：
-
-```text
-每个样本独立 rasterize
-positive grid = grid score > 该样本 occupied grids 的 mean(grid score)
-```
-
-KDTree backend：
-
-```text
-positive cell = cell score > 该样本所有 finite cells 的 mean(cell score)
-positive cells --radius expansion--> KDTree occupancy domain
-```
-
-这种模式适合复现原 SPHERE-style 分析，但由于每个样本使用不同阈值，不建议直接把 positive proportion 用于样本组间比较。
-
-## 16.2 Cohort-wide cutoff：`calculate_cutoffs()`
-
-### median of sample-level median scores
-
-```python
-cr = pysphere.calculate_cutoffs(
-    adata,
-    features=["Hypoxia_score"],
-    level="cell",
-    method="median_of_sample_medians",
-)
-```
-
-定义：
-
-```text
-每个 sample -> median(score)
-所有 sample medians -> median
-```
-
-### mean of sample-level mean scores
-
-```python
-cr = pysphere.calculate_cutoffs(
-    adata,
-    features=["Hypoxia_score"],
-    level="cell",
-    method="mean_of_sample_means",
-)
-```
-
-定义：
-
-```text
-每个 sample -> mean(score)
-所有 sample means -> mean
-```
-
-这两种方法都让每个样本对最终 cutoff 贡献相同权重，不会让大样本因为 cell/grid 数量更多而主导阈值。
-
-### balanced global median / mean
-
-```python
-cr = pysphere.calculate_cutoffs(
-    adata,
-    features=["Hypoxia_score"],
-    level="cell",
-    method="balanced_global_median",  # 或 balanced_global_mean
-    n_repeats=100,
-    balance_round_to=1000,
-    random_state=666,
-)
-```
-
-默认算法：
-
-```text
-1. 对每个 feature 统计每个 sample 的 finite unit 数量
-2. 找到最小样本数量
-3. 向下取整到 1000 的整数倍
-   例如 12,345 -> 12,000
-4. 每个 sample 无放回随机抽取相同数量的单位
-5. 合并所有 sample 的抽样值
-6. 计算 pooled median 或 pooled mean
-7. 重复 100 次
-8. balanced_global_median -> 取 100 个 repeat median 的 median
-   balanced_global_mean   -> 取 100 个 repeat mean 的 mean
-```
-
-`level="cell"` 时抽样单位是 cell/spot；`level="grid"` 时抽样单位是每个样本独立 rasterize 后的 occupied finite grid。
-
-如果最小样本少于 1000 个单位，默认直接使用最小样本的实际单位数。也可以手动指定：
-
-```python
-balance_n=8000
-balance_round_to=500
-n_repeats=200
-```
-
-### Cell-level cutoff
-
-```python
-cell_cutoff = pysphere.calculate_cutoffs(
-    adata,
-    ["Hypoxia_score", "Inflammation_score"],
-    level="cell",
-    method="balanced_global_median",
-)
-```
-
-### Grid-level cutoff
-
-```python
-grid_cutoff = pysphere.calculate_cutoffs(
-    adata,
-    ["Hypoxia_score", "Inflammation_score"],
-    level="grid",
-    method="balanced_global_median",
-    grid_size=20,
-    agg="mean",
-)
-```
-
-Cell-level cutoff 与 grid-level cutoff 是不同的统计量，不应混用。Grid SPHERE 应使用 grid-level cutoff；KDTree SPHERE 应使用 cell-level cutoff。
-
-## 16.3 在 SPHERE 中直接调用 cohort cutoff
-
-Grid：
-
-```python
-rs_grid = pysphere.spatial_vector_x(
-    adata,
-    target="Hypoxia_score",
-    features=["Inflammation_score"],
-    backend="grid",
-    grid_size=20,
-    cutoff_method="balanced_global_median",
-)
-```
-
-KDTree：
-
-```python
-rs_kd = pysphere.spatial_vector_x(
-    adata,
-    target="Hypoxia_score",
-    features=["Inflammation_score"],
-    backend="kdtree",
-    radius=15,
-    cutoff_method="balanced_global_median",
-)
-```
-
-`sat4sc` 会自动选择 cutoff 计算层级：
-
-```text
-backend="grid"   -> level="grid"
-backend="kdtree" -> level="cell"
-```
-
-结果的：
-
-```python
-rs_grid.settings["cutoff_method"]
-rs_grid.settings["cutoffs"]
-rs_grid.pool_raw[
-    ["sample", "cutoff_target", "cutoff_feature",
-     "positive_fraction_target", "positive_fraction_feature"]
-]
-```
-
-可以直接检查所有样本是否使用了同一 cutoff，并查看每个样本的 positive proportion。
-
-同样的 `cutoff_method=` 参数也可直接用于：
-
-```python
-grid_feature_map()
-kdtree_domain_map()
-pairwise_projected_scores()
-```
-
-## 16.4 比较每个样本的 positive proportion
-
-```python
-positive_grid = pysphere.positive_proportions(
-    adata,
-    features=["Hypoxia_score"],
-    level="grid",
-    cutoff_method="balanced_global_median",
-    grid_size=20,
-)
-```
-
-输出包括：
-
-```text
-sample
-feature
-level
-cutoff
-n_units
-n_positive
-positive_fraction
-```
-
-建议后续以 **sample 为统计单位** 比较不同 `sample_group` 的 `positive_fraction`，而不是把所有 cell/grid 当作独立生物学重复。
-
-## 16.5 `plot_binary_overlay()` 使用 cohort cutoff
-
-Cell-level：
-
-```python
-fig, ax, info = pysphere_plotting.plot_binary_overlay(
-    adata,
-    feature1="Hypoxia_score",
-    feature2="Inflammation_score",
-    sample="sample01",
-    space="cell",
-    cutoff_method="balanced_global_median",
-)
-```
-
-Grid-level：
-
-```python
-fig, ax, info = pysphere_plotting.plot_binary_overlay(
-    adata,
-    feature1="Hypoxia_score",
-    feature2="Inflammation_score",
-    sample="sample01",
-    space="grid",
-    grid_size=20,
-    cutoff_method="balanced_global_median",
-)
-```
-
-也可以先计算一次 cutoff，然后反复复用，避免重复随机抽样：
-
-```python
-cr = pysphere.calculate_cutoffs(
-    adata,
-    ["Hypoxia_score", "Inflammation_score"],
-    level="cell",
-    method="balanced_global_median",
-)
-
-fig, ax, info = pysphere_plotting.plot_binary_overlay(
-    adata,
-    "Hypoxia_score",
-    "Inflammation_score",
-    sample="sample01",
-    space="cell",
-    cohort_cutoffs=cr,
-)
-```
-
-低层接口也可以直接复用：
-
-```python
-pysphere_plotting.plot_spatial_overlap(obj1, obj2, cutoffs=cr)
-pysphere.spatial_binstat(obj1, min_cutoff=cr)
-pysphere.spatial_cordstat(obj1, obj2, min_cutoffs=cr)
-```
-
-## 16.6 手动 cutoff 与 quantile cutoff
-
-旧接口继续支持：
-
-```python
-cutoffs={
-    "Hypoxia_score": 0.12,
-    "Inflammation_score": 0.08,
-}
-```
-
-或 sample-specific quantile：
-
-```python
-quantile_cutoffs=0.75
-```
-
-如果同时提供 `cutoff_method` 与 `cutoffs`，显式 `cutoffs` 会按 feature 覆盖计算得到的 cohort cutoff。`cutoff_method` 与 `quantile_cutoffs` 不允许同时使用，以避免阈值语义冲突。
-
----
-
-# 17. 计算 pathway/module score
-
-提供 Seurat `AddModuleScore` 风格实现：
-
-```python
-gene_sets = {
-    "Hypoxia_score": ["CA9", "VEGFA", "BNIP3", "NDRG1"],
-    "GlycoScore": ["HK1", "HK2", "PFKP", "ALDOA", "PGK1", "ENO2", "PKM", "LDHA"],
-}
-
-pysphere.add_module_scores(
-    adata,
-    gene_sets,
-    layer=None,
-    nbin=10,
-    ctrl=100,
-    seed=666,
-    inplace=True,
-)
-```
-
-由于 NumPy 和 R 的随机数实现不同，不保证与 Seurat bit-for-bit 完全一致。
-
----
-
-# 18. 性能与内存
-
-## Grid backend
-
-主要优化：
-
-1. 不复制完整 AnnData；
-2. 每个样本只构建一次 grid；
-3. 使用 `numpy.bincount` 做 cell → grid 聚合；
-4. 位移通过 array slice 实现；
-5. 不生成 cell-cell distance matrix。
-
-## KDTree backend
-
-主要优化：
-
-1. 使用 `scipy.spatial.cKDTree`，不创建 N×N distance matrix；
-2. 每个 feature 只建立一个 positive-cell KDTree；
-3. shifted B 通过查询 `anchor_coords - shift` 实现，不需要每次重建平移后的 KDTree；
-4. pairwise 模式缓存最终 step 的 shifted domains；
-5. `workers=-1` 可使用 SciPy KDTree 的多线程查询，但在 Slurm 环境建议与申请 CPU 数匹配，避免过度占用。
-
-对于 50 万级细胞，始终建议按 `sample_name` 分样本计算。
-
----
-
-# 19. Grid vs KDTree：推荐怎么用
-
-### 推荐主分析：Grid
-
-适合：
-
-- Hypoxia niche vs Inflammation niche；
-- GlycoHigh niche；
-- 大尺度肿瘤生态位；
-- 希望不同空间位置按相同面积权重统计。
-
-### 推荐敏感性分析/单细胞扩展：KDTree
-
-适合：
-
-- 某细胞类型 vs niche；
-- Myeloid vs Tumor state；
-- Endothelial vs Pericyte；
-- gene-positive cells vs pathway niche；
-- 希望尽量保留原始 cell centroid。
-
-最稳妥的发表策略是：
-
-```text
-Grid SPHERE 作为主结果
-        +
-KDTree SPHERE 作为 cell-resolved sensitivity analysis
-```
-
-比较：
-
-- projected score 相关性；
-- Q3/Q4 分类一致率；
-- feature 排序一致性；
-- Figure 4B 共定位样本比例稳定性。
-
----
-
-# 20. 推荐 Xenium 敏感性分析
-
-Grid：
-
-```python
-grid_sizes = [10, 20, 25]
-```
-
-KDTree：
-
-```python
-radii = [10, 15, 20]
-```
-
-位移距离：
-
-```python
-steps = (25, 50, 75, 100, 125, 150)
-```
-
-建议检查不同参数下：
-
-- projected score 正负方向；
-- magnitude；
-- pairwise heatmap 模块；
-- co-localization 分类；
-- 组织边界 coverage。
-
----
-
-# 21. 最简完整示例
-
-```python
-from sat4sc import pysphere, pysphere_plotting
-
-# 1. 先看 grid 后的 Hypoxia 空间分布
-gm = pysphere.grid_feature_map(
-    adata,
-    feature="Hypoxia_score",
-    sample="sample01",
-    grid_size=20,
-)
-
-fig, ax = pysphere_plotting.plot_grid_feature_map(
-    gm,
-    show_positive_outline=True,
-)
-
-# 2. Grid SPHERE
-rs_grid = pysphere.spatial_vector_x(
-    adata,
-    target="Hypoxia_score",
-    features=["Inflammation_score"],
-    sample_key="sample_name",
-    backend="grid",
-    grid_size=20,
-)
-
-# 3. KDTree SPHERE
-rs_kd = pysphere.spatial_vector_x(
-    adata,
-    target="Hypoxia_score",
-    features=["Inflammation_score"],
-    sample_key="sample_name",
-    backend="kdtree",
-    radius=15,
-    steps=(25, 50, 75, 100, 125, 150),
-    min_coverage=0.7,
-    workers=-1,
-)
-
-# 4. KDTree occupancy 可视化
-km = pysphere.kdtree_domain_map(
-    adata,
-    target="Hypoxia_score",
-    feature="Inflammation_score",
-    sample="sample01",
-    radius=15,
-)
-
-fig, ax = pysphere_plotting.plot_kdtree_domain_map(km)
-
-# 5. Figure 3B-like
-fig, ax = pysphere_plotting.plot_vector(rs_kd)
-
-# 6. Figure 4B-like
-fig, ax, stat = pysphere_plotting.plot_colocalization_distribution(
-    rs_kd,
-    feature="Inflammation_score",
-    threshold=0,
-)
-
-print(stat)
-```
-
----
-
-## Citation / attribution
-
-`sat4sc.pysphere` is based on the algorithmic design of SPHERE:
-
-Wu L, Wu G, Zhai Y, et al. *Dissection of spatial hypoxic and inflammatory ecosystem in glioblastoma*. Cancer Letters. 2026;657:218718.
-
-Original R repository: `woolingxiang/SPHERE`.
-
-The KDTree backend is a sat4sc extension for continuous single-cell spatial coordinates and should not be described as mathematically identical to the original Visium-lattice implementation.
-
-See `NOTICE.md` for attribution and licensing notes.
+See `LICENSE` and `NOTICE.md`.

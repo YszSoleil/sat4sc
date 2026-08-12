@@ -3,23 +3,21 @@
 Python/AnnData reimplementation and single-cell extension of the SPHERE spatial
 displacement framework.
 
-Two interchangeable backends are provided:
+The recommended backend is ``backend="grid"``: cell centroids are rasterized
+to equal-area regular bins and the eight-direction displacement/Jaccard logic
+is applied to binary spatial objects. Starting in v0.4.0, each binary object can
+come either from the usual feature-positive cell/grid call or directly from a
+precomputed ``in_niche`` identity returned by :func:`define_niche` or
+:func:`define_niches`.
 
-``backend="grid"``
-    Continuous cell centroids are rasterized to equal-area regular bins, then
-    the original eight-direction SPHERE displacement/Jaccard logic is applied.
-    This is the most faithful adaptation when spatial *area* should carry equal
-    weight and is also suitable for Visium-like lattices.
+``backend="kdtree"`` is retained as an experimental cell-resolved extension.
+It converts active cells into radius-defined occupancy domains on real cell
+anchors before the same displacement/Jaccard summaries are calculated. For
+routine analyses, use the regular-grid backend unless the KDTree behavior is
+specifically required.
 
-``backend="kdtree"``
-    Continuous cell coordinates are retained. Positive feature cells are
-    converted into radius-defined occupancy domains on the real cell anchors
-    using :class:`scipy.spatial.cKDTree`. Object B is then virtually displaced
-    in eight directions and re-projected onto the fixed anchors before computing
-    Jaccard and delta-Jaccard. This is a cell-resolved extension of SPHERE.
-
-The common downstream quantities are unchanged: minimum/maximum delta-Jaccard
-at each step, final-step projected score, and vector-path magnitude.
+The downstream quantities are unchanged: minimum/maximum delta-Jaccard at each
+step, final-step projected score, and vector-path magnitude.
 """
 
 from __future__ import annotations
@@ -154,6 +152,8 @@ class KDTreeDomainResult:
     cutoff_feature: float
     shift: tuple[float, float] = (0.0, 0.0)
     coverage_fraction: float = 1.0
+    target_source: str = "positive"
+    feature_source: str = "positive"
 
 
 CUTOFF_METHODS = (
@@ -223,6 +223,136 @@ class NicheResult:
     settings: dict = field(default_factory=dict)
     cutoff_result: CutoffResult | None = None
 
+
+
+def _normalize_niche_features(
+    niche_features: Mapping[str, NicheResult] | None,
+    allowed_features: Sequence[str] | None = None,
+) -> dict[str, NicheResult]:
+    """Normalize feature -> :class:`NicheResult` mappings used by SPHERE.
+
+    A mapped feature is treated as an already-binarized spatial object: its
+    ``in_niche`` identity replaces the usual feature-positive cell/grid call in
+    all downstream Jaccard displacement calculations.
+    """
+    if niche_features is None:
+        return {}
+    if not isinstance(niche_features, Mapping):
+        raise TypeError("niche_features must be a mapping of feature name -> NicheResult, or None.")
+    out: dict[str, NicheResult] = {}
+    for key, value in niche_features.items():
+        feature = str(key)
+        if not isinstance(value, NicheResult):
+            raise TypeError(
+                f"niche_features[{feature!r}] must be a NicheResult returned by "
+                "define_niche()/define_niches()."
+            )
+        if str(value.feature) != feature:
+            warnings.warn(
+                f"niche_features key {feature!r} does not match NicheResult.feature "
+                f"{value.feature!r}. The mapping key controls which SPHERE feature is "
+                "replaced by niche membership.",
+                stacklevel=2,
+            )
+        out[feature] = value
+    if allowed_features is not None:
+        allowed = set(map(str, allowed_features))
+        extra = [feature for feature in out if feature not in allowed]
+        if extra:
+            raise ValueError(
+                "niche_features contains keys that are not present in the requested "
+                f"target/features: {extra}."
+            )
+    return out
+
+
+def _resolve_niche_sample_result(
+    niche: NicheResult,
+    sample_name: str | None,
+) -> NicheSampleResult:
+    """Resolve one sample from a cohort-aware :class:`NicheResult`."""
+    if sample_name is not None and str(sample_name) in niche.sample_results:
+        return niche.sample_results[str(sample_name)]
+    if sample_name in (None, "obj") and len(niche.sample_results) == 1:
+        return next(iter(niche.sample_results.values()))
+    available = list(niche.sample_results)
+    raise KeyError(
+        f"NicheResult for {niche.feature!r} does not contain sample {sample_name!r}. "
+        f"Available samples: {available}. If the AnnData contains multiple samples, "
+        "use spatial_vector(..., sample=...) or spatial_vector_x(...)."
+    )
+
+
+def _niche_cell_membership(
+    niche: NicheResult,
+    sample_name: str | None,
+    obs_idx: np.ndarray,
+) -> np.ndarray:
+    """Return cell-level ``in_niche`` membership aligned to ``obs_idx``."""
+    sample_result = _resolve_niche_sample_result(niche, sample_name)
+    ref_idx = np.asarray(sample_result.cell_indices, dtype=np.int64)
+    query_idx = np.asarray(obs_idx, dtype=np.int64)
+    if ref_idx.size == query_idx.size and np.array_equal(ref_idx, query_idx):
+        return np.asarray(sample_result.cell_niche, dtype=bool).copy()
+    if ref_idx.size == 0:
+        raise ValueError(f"NicheResult for {niche.feature!r} contains no cells for sample {sample_name!r}.")
+    order = np.argsort(ref_idx, kind="mergesort")
+    ref_sorted = ref_idx[order]
+    pos = np.searchsorted(ref_sorted, query_idx)
+    valid = pos < ref_sorted.size
+    valid[valid] &= ref_sorted[pos[valid]] == query_idx[valid]
+    if not valid.all():
+        missing = query_idx[~valid][:10].tolist()
+        raise ValueError(
+            f"NicheResult for {niche.feature!r} is not aligned to the AnnData observations. "
+            f"Missing observation indices include {missing}. Use the NicheResult generated "
+            "from the same AnnData object/subset used for SPHERE."
+        )
+    niche_sorted = np.asarray(sample_result.cell_niche, dtype=bool)[order]
+    return niche_sorted[pos]
+
+
+def _niche_grid_membership(
+    niche: NicheResult,
+    sample_name: str | None,
+    coords: np.ndarray,
+    occupied: np.ndarray,
+    grid_size: float,
+) -> np.ndarray:
+    """Return grid-level ``in_niche`` membership after strict geometry checks."""
+    sample_result = _resolve_niche_sample_result(niche, sample_name)
+    niche_grid_size = float(niche.settings.get("grid_size", np.nan))
+    if not np.isfinite(niche_grid_size) or not np.isclose(niche_grid_size, float(grid_size)):
+        raise ValueError(
+            f"Grid-size mismatch for niche feature {niche.feature!r}: niche was defined "
+            f"with grid_size={niche_grid_size!r}, but SPHERE uses grid_size={grid_size!r}. "
+            "Use the same grid_size for define_niche(s) and backend='grid'."
+        )
+    ref_coords = np.asarray(sample_result.coords, dtype=float)
+    coords = np.asarray(coords, dtype=float)
+    if ref_coords.shape != coords.shape or not np.allclose(ref_coords, coords, rtol=0.0, atol=1e-8):
+        raise ValueError(
+            f"NicheResult for {niche.feature!r} is not aligned to the current sample coordinates. "
+            "Use the NicheResult generated from the same AnnData object/subset."
+        )
+    niche_grid = np.asarray(sample_result.niche_grid, dtype=bool)
+    niche_occupied = np.asarray(sample_result.occupied, dtype=bool)
+    if niche_grid.shape != occupied.shape or niche_occupied.shape != occupied.shape:
+        raise ValueError(
+            f"Grid geometry mismatch for niche feature {niche.feature!r}. Use identical "
+            "grid_size and min_cells_per_bin when defining the niche and running SPHERE."
+        )
+    if not np.array_equal(niche_occupied, np.asarray(occupied, dtype=bool)):
+        raise ValueError(
+            f"Occupied-grid mask mismatch for niche feature {niche.feature!r}. This usually "
+            "means min_cells_per_bin or the analyzed cells differ between define_niche(s) "
+            "and SPHERE."
+        )
+    return niche_grid & np.asarray(occupied, dtype=bool)
+
+
+def _binary_source(feature: str, niche_features: Mapping[str, NicheResult]) -> str:
+    return "niche" if str(feature) in niche_features else "positive"
 
 def _normalize_cutoff_level(level: str) -> str:
     key = str(level).lower().replace("-", "_")
@@ -1288,18 +1418,26 @@ def _shifted_jaccard(
     return jac, inter, n_a, n_b, int(domain.sum())
 
 
-def _cordstat_from_grids(
-    target_grid: np.ndarray,
-    feature_grid: np.ndarray,
+def _cordstat_from_binary_grids(
+    target_pos: np.ndarray,
+    feature_pos: np.ndarray,
     occupied: np.ndarray,
-    cutoff_target: float,
-    cutoff_feature: float,
     step: int | None = None,
     round_jaccard: int | None = 4,
     operator_steps: Sequence[int] | None = None,
 ) -> pd.DataFrame:
-    target_pos = occupied & np.isfinite(target_grid) & (target_grid > cutoff_target)
-    feature_pos = occupied & np.isfinite(feature_grid) & (feature_grid > cutoff_feature)
+    """Compute displacement statistics from already-binarized grid objects.
+
+    This is the shared engine for both ordinary feature-positive grids and
+    v0.4 niche-aware grids. Once binary masks are supplied, all subsequent
+    Jaccard, delta-Jaccard, directional extrema, projected-score and magnitude
+    calculations are identical.
+    """
+    occupied = np.asarray(occupied, dtype=bool)
+    target_pos = np.asarray(target_pos, dtype=bool) & occupied
+    feature_pos = np.asarray(feature_pos, dtype=bool) & occupied
+    if target_pos.shape != occupied.shape or feature_pos.shape != occupied.shape:
+        raise ValueError("target_pos, feature_pos and occupied must have identical shapes.")
     j0 = _jaccard(target_pos[occupied], feature_pos[occupied])
     if round_jaccard is not None and np.isfinite(j0):
         j0 = round(j0, round_jaccard)
@@ -1325,8 +1463,10 @@ def _cordstat_from_grids(
     orig_pmin = np.nan if max(orig_a, orig_b) == 0 else orig_inter / max(orig_a, orig_b)
     orig_pmax = np.nan if min(orig_a, orig_b) == 0 else orig_inter / min(orig_a, orig_b)
     if round_jaccard is not None:
-        if np.isfinite(orig_pmin): orig_pmin = round(orig_pmin, round_jaccard)
-        if np.isfinite(orig_pmax): orig_pmax = round(orig_pmax, round_jaccard)
+        if np.isfinite(orig_pmin):
+            orig_pmin = round(orig_pmin, round_jaccard)
+        if np.isfinite(orig_pmax):
+            orig_pmax = round(orig_pmax, round_jaccard)
 
     rows = []
     for dx, dy, name in deltas:
@@ -1339,8 +1479,10 @@ def _cordstat_from_grids(
         pmin = np.nan if max(n_a, n_b) == 0 else inter / max(n_a, n_b)
         pmax = np.nan if min(n_a, n_b) == 0 else inter / min(n_a, n_b)
         if round_jaccard is not None:
-            if np.isfinite(pmin): pmin = round(pmin, round_jaccard)
-            if np.isfinite(pmax): pmax = round(pmax, round_jaccard)
+            if np.isfinite(pmin):
+                pmin = round(pmin, round_jaccard)
+            if np.isfinite(pmax):
+                pmax = round(pmax, round_jaccard)
         rows.append(
             {
                 "direction": name,
@@ -1359,6 +1501,28 @@ def _cordstat_from_grids(
             }
         )
     return pd.DataFrame(rows).set_index("direction")
+
+
+def _cordstat_from_grids(
+    target_grid: np.ndarray,
+    feature_grid: np.ndarray,
+    occupied: np.ndarray,
+    cutoff_target: float,
+    cutoff_feature: float,
+    step: int | None = None,
+    round_jaccard: int | None = 4,
+    operator_steps: Sequence[int] | None = None,
+) -> pd.DataFrame:
+    target_pos = occupied & np.isfinite(target_grid) & (target_grid > cutoff_target)
+    feature_pos = occupied & np.isfinite(feature_grid) & (feature_grid > cutoff_feature)
+    return _cordstat_from_binary_grids(
+        target_pos,
+        feature_pos,
+        occupied,
+        step=step,
+        round_jaccard=round_jaccard,
+        operator_steps=operator_steps,
+    )
 
 
 def spatial_cordstat(
@@ -1545,6 +1709,22 @@ def _kdtree_prepare_feature(
     return cutoff, positive, positive_coords, tree, domain
 
 
+
+def _kdtree_prepare_binary(
+    coords: np.ndarray,
+    active: np.ndarray,
+    radius: float,
+    workers: int,
+):
+    """Create a KDTree occupancy domain from an already-binary cell mask."""
+    active = np.asarray(active, dtype=bool)
+    if active.ndim != 1 or active.shape[0] != coords.shape[0]:
+        raise ValueError("Binary cell mask must have one value per coordinate row.")
+    active_coords = coords[active]
+    tree = cKDTree(active_coords) if active_coords.shape[0] else None
+    domain = _domain_from_positive_tree(coords, tree, radius, workers=workers)
+    return active, active_coords, tree, domain
+
 def _shift_coverage(
     anchor_tree: cKDTree,
     positive_coords: np.ndarray,
@@ -1645,18 +1825,26 @@ def kdtree_domain_map(
     cutoff_random_state: int = 666,
     shift: tuple[float, float] = (0.0, 0.0),
     workers: int = 1,
+    niche_features: Mapping[str, NicheResult] | None = None,
 ) -> KDTreeDomainResult:
     """Prepare target/feature radius domains for direct spatial visualization.
 
-    By default, KDTree positivity uses the legacy sample-specific mean. Set
-    ``cutoff_method`` to a cohort-wide method from :func:`calculate_cutoffs` to
-    use shared **cell-level** thresholds. Explicit values in ``cutoffs`` override
-    calculated cutoffs feature-by-feature.
+    ``niche_features`` can replace either input's ordinary positive-cell call
+    with its cell-level ``in_niche`` identity. The niche cells are then treated
+    exactly like positive cells when creating the radius-defined KDTree domain.
+
+    Notes
+    -----
+    The KDTree backend is experimental in v0.4.0. For routine SPHERE analyses,
+    the regular-grid backend is recommended.
     """
     if radius <= 0:
         raise ValueError("radius must be > 0.")
     if cutoff_method is not None and quantile_cutoffs is not None:
         raise ValueError("quantile_cutoffs and cutoff_method cannot be used together.")
+    target = str(target)
+    feature = str(feature)
+    niche_map = _normalize_niche_features(niche_features, [target, feature])
     if sample is None:
         idx = np.arange(adata.n_obs, dtype=np.int64)
         sample_name = None
@@ -1667,20 +1855,31 @@ def kdtree_domain_map(
         if idx.size == 0:
             raise ValueError(f"No observations found for {sample_key}={sample!r}.")
         sample_name = str(sample)
+    cutoff_features = [x for x in (target, feature) if x not in niche_map]
     resolved_cutoffs, _ = _merge_calculated_cutoffs(
-        adata, [target, feature], cutoffs, cutoff_method, "cell", sample_key,
+        adata, cutoff_features, cutoffs, cutoff_method, "cell", sample_key,
         cutoff_samples, coord_cols, spatial_key, layer, 20.0, "mean", 1,
         cutoff_n_repeats, cutoff_balance_round_to, cutoff_balance_n, cutoff_random_state,
     )
     coords = _resolve_coords(adata, idx, coord_cols=coord_cols, spatial_key=spatial_key)
-    target_values = _resolve_feature_vector(adata, target, idx, layer=layer)
-    feature_values = _resolve_feature_vector(adata, feature, idx, layer=layer)
-    ct, tpos, tcoords, ttree, tdomain = _kdtree_prepare_feature(
-        coords, target_values, target, radius, resolved_cutoffs, quantile_cutoffs, workers
-    )
-    cf, fpos, fcoords, ftree, _ = _kdtree_prepare_feature(
-        coords, feature_values, feature, radius, resolved_cutoffs, quantile_cutoffs, workers
-    )
+    if target in niche_map:
+        tpos = _niche_cell_membership(niche_map[target], sample_name, idx)
+        tpos, tcoords, ttree, tdomain = _kdtree_prepare_binary(coords, tpos, radius, workers)
+        ct = np.nan
+    else:
+        target_values = _resolve_feature_vector(adata, target, idx, layer=layer)
+        ct, tpos, tcoords, ttree, tdomain = _kdtree_prepare_feature(
+            coords, target_values, target, radius, resolved_cutoffs, quantile_cutoffs, workers
+        )
+    if feature in niche_map:
+        fpos = _niche_cell_membership(niche_map[feature], sample_name, idx)
+        fpos, fcoords, ftree, _ = _kdtree_prepare_binary(coords, fpos, radius, workers)
+        cf = np.nan
+    else:
+        feature_values = _resolve_feature_vector(adata, feature, idx, layer=layer)
+        cf, fpos, fcoords, ftree, _ = _kdtree_prepare_feature(
+            coords, feature_values, feature, radius, resolved_cutoffs, quantile_cutoffs, workers
+        )
     anchor_tree = cKDTree(coords)
     fdomain = _domain_from_positive_tree(coords, ftree, radius, query_shift=shift, workers=workers)
     coverage = _shift_coverage(anchor_tree, fcoords, shift, radius, workers=workers)
@@ -1690,14 +1889,16 @@ def kdtree_domain_map(
         feature_domain=fdomain,
         target_positive=tpos,
         feature_positive=fpos,
-        target=str(target),
-        feature=str(feature),
+        target=target,
+        feature=feature,
         sample=sample_name,
         radius=float(radius),
         cutoff_target=float(ct),
         cutoff_feature=float(cf),
         shift=(float(shift[0]), float(shift[1])),
         coverage_fraction=float(coverage) if np.isfinite(coverage) else np.nan,
+        target_source=_binary_source(target, niche_map),
+        feature_source=_binary_source(feature, niche_map),
     )
 
 
@@ -1718,31 +1919,56 @@ def _single_sample_vectors_grid(
     quantile_cutoffs: Mapping[str, float] | float | None,
     min_cells_per_bin: int,
     round_jaccard: int | None,
+    niche_features: Mapping[str, NicheResult],
 ) -> pd.DataFrame:
     coords = _resolve_coords(adata, obs_idx, coord_cols=coord_cols, spatial_key=spatial_key)
     flat, counts, occupied, shape, _ = _make_grid(coords, grid_size, min_cells_per_bin)
-    target_values = _resolve_feature_vector(adata, target, obs_idx, layer=layer)
-    target_grid = _aggregate_grid(target_values, flat, counts, shape, agg=agg)
-    cutoff_target = _choose_cutoff(target, target_grid, occupied, cutoffs, quantile_cutoffs)
-    target_positive = occupied & np.isfinite(target_grid) & (target_grid > cutoff_target)
+    if target in niche_features:
+        target_positive = _niche_grid_membership(
+            niche_features[target], sample_name, coords, occupied, grid_size
+        )
+        cutoff_target = np.nan
+    else:
+        target_values = _resolve_feature_vector(adata, target, obs_idx, layer=layer)
+        target_grid = _aggregate_grid(target_values, flat, counts, shape, agg=agg)
+        cutoff_target = _choose_cutoff(target, target_grid, occupied, cutoffs, quantile_cutoffs)
+        target_positive = occupied & np.isfinite(target_grid) & (target_grid > cutoff_target)
     n_bins = int(occupied.sum())
     n_positive_target = int(target_positive.sum())
     rows = []
     for feature in features:
-        try:
-            feature_values = _resolve_feature_vector(adata, feature, obs_idx, layer=layer)
-        except KeyError:
-            for step in steps:
-                rows.append({"min_djaccard": np.nan, "max_djaccard": np.nan, "feature": feature, "step": float(step), "sample": sample_name})
-            continue
-        feature_grid = _aggregate_grid(feature_values, flat, counts, shape, agg=agg)
-        cutoff_feature = _choose_cutoff(feature, feature_grid, occupied, cutoffs, quantile_cutoffs)
-        feature_positive = occupied & np.isfinite(feature_grid) & (feature_grid > cutoff_feature)
+        if feature in niche_features:
+            feature_positive = _niche_grid_membership(
+                niche_features[feature], sample_name, coords, occupied, grid_size
+            )
+            cutoff_feature = np.nan
+        else:
+            try:
+                feature_values = _resolve_feature_vector(adata, feature, obs_idx, layer=layer)
+            except KeyError:
+                for step in steps:
+                    rows.append({
+                        "min_djaccard": np.nan,
+                        "max_djaccard": np.nan,
+                        "feature": feature,
+                        "step": float(step),
+                        "sample": sample_name,
+                        "backend": "grid",
+                        "binary_source_target": _binary_source(target, niche_features),
+                        "binary_source_feature": _binary_source(feature, niche_features),
+                    })
+                continue
+            feature_grid = _aggregate_grid(feature_values, flat, counts, shape, agg=agg)
+            cutoff_feature = _choose_cutoff(feature, feature_grid, occupied, cutoffs, quantile_cutoffs)
+            feature_positive = occupied & np.isfinite(feature_grid) & (feature_grid > cutoff_feature)
         n_positive_feature = int(feature_positive.sum())
         for step in steps:
-            stat = _cordstat_from_grids(
-                target_grid, feature_grid, occupied, cutoff_target, cutoff_feature,
-                int(round(step)), round_jaccard=round_jaccard,
+            stat = _cordstat_from_binary_grids(
+                target_positive,
+                feature_positive,
+                occupied,
+                step=int(round(step)),
+                round_jaccard=round_jaccard,
             )
             diff = stat["diff_pct"].to_numpy(dtype=float)
             mn = float(np.nanmin(diff)) if np.isfinite(diff).any() else np.nan
@@ -1757,15 +1983,22 @@ def _single_sample_vectors_grid(
                     "cutoff_target": cutoff_target,
                     "cutoff_feature": cutoff_feature,
                     "n_bins": n_bins,
+                    # Backward-compatible column names. In v0.4 these count the
+                    # active binary units, which may come from positivity or niche.
                     "n_positive_target": n_positive_target,
                     "n_positive_feature": n_positive_feature,
                     "positive_fraction_target": np.nan if n_bins == 0 else n_positive_target / n_bins,
                     "positive_fraction_feature": np.nan if n_bins == 0 else n_positive_feature / n_bins,
+                    "n_binary_target": n_positive_target,
+                    "n_binary_feature": n_positive_feature,
+                    "binary_fraction_target": np.nan if n_bins == 0 else n_positive_target / n_bins,
+                    "binary_fraction_feature": np.nan if n_bins == 0 else n_positive_feature / n_bins,
+                    "binary_source_target": _binary_source(target, niche_features),
+                    "binary_source_feature": _binary_source(feature, niche_features),
                     "backend": "grid",
                 }
             )
     return pd.DataFrame(rows)
-
 
 
 def _single_sample_vectors_kdtree(
@@ -1785,26 +2018,50 @@ def _single_sample_vectors_kdtree(
     min_coverage: float,
     workers: int,
     round_jaccard: int | None,
+    niche_features: Mapping[str, NicheResult],
 ) -> pd.DataFrame:
     coords = _resolve_coords(adata, obs_idx, coord_cols=coord_cols, spatial_key=spatial_key)
     anchor_tree = cKDTree(coords)
-    target_values = _resolve_feature_vector(adata, target, obs_idx, layer=layer)
-    cutoff_target, target_positive, _, _, target_domain = _kdtree_prepare_feature(
-        coords, target_values, target, radius, cutoffs, quantile_cutoffs, workers
-    )
+    if target in niche_features:
+        target_positive = _niche_cell_membership(niche_features[target], sample_name, obs_idx)
+        target_positive, _, _, target_domain = _kdtree_prepare_binary(
+            coords, target_positive, radius, workers
+        )
+        cutoff_target = np.nan
+    else:
+        target_values = _resolve_feature_vector(adata, target, obs_idx, layer=layer)
+        cutoff_target, target_positive, _, _, target_domain = _kdtree_prepare_feature(
+            coords, target_values, target, radius, cutoffs, quantile_cutoffs, workers
+        )
     n_anchors = int(coords.shape[0])
     n_positive_target = int(np.count_nonzero(target_positive))
     rows = []
     for feature in features:
-        try:
-            feature_values = _resolve_feature_vector(adata, feature, obs_idx, layer=layer)
-        except KeyError:
-            for step in steps:
-                rows.append({"min_djaccard": np.nan, "max_djaccard": np.nan, "feature": feature, "step": float(step), "sample": sample_name})
-            continue
-        cutoff_feature, positive, positive_coords, feature_tree, feature_domain = _kdtree_prepare_feature(
-            coords, feature_values, feature, radius, cutoffs, quantile_cutoffs, workers
-        )
+        if feature in niche_features:
+            positive = _niche_cell_membership(niche_features[feature], sample_name, obs_idx)
+            positive, positive_coords, feature_tree, feature_domain = _kdtree_prepare_binary(
+                coords, positive, radius, workers
+            )
+            cutoff_feature = np.nan
+        else:
+            try:
+                feature_values = _resolve_feature_vector(adata, feature, obs_idx, layer=layer)
+            except KeyError:
+                for step in steps:
+                    rows.append({
+                        "min_djaccard": np.nan,
+                        "max_djaccard": np.nan,
+                        "feature": feature,
+                        "step": float(step),
+                        "sample": sample_name,
+                        "backend": "kdtree",
+                        "binary_source_target": _binary_source(target, niche_features),
+                        "binary_source_feature": _binary_source(feature, niche_features),
+                    })
+                continue
+            cutoff_feature, positive, positive_coords, feature_tree, feature_domain = _kdtree_prepare_feature(
+                coords, feature_values, feature, radius, cutoffs, quantile_cutoffs, workers
+            )
         n_positive_feature = int(np.count_nonzero(positive))
         for step in steps:
             stat = _cordstat_from_kdtree(
@@ -1839,13 +2096,18 @@ def _single_sample_vectors_kdtree(
                     "n_positive_feature": n_positive_feature,
                     "positive_fraction_target": np.nan if n_anchors == 0 else n_positive_target / n_anchors,
                     "positive_fraction_feature": np.nan if n_anchors == 0 else n_positive_feature / n_anchors,
+                    "n_binary_target": n_positive_target,
+                    "n_binary_feature": n_positive_feature,
+                    "binary_fraction_target": np.nan if n_anchors == 0 else n_positive_target / n_anchors,
+                    "binary_fraction_feature": np.nan if n_anchors == 0 else n_positive_feature / n_anchors,
+                    "binary_source_target": _binary_source(target, niche_features),
+                    "binary_source_feature": _binary_source(feature, niche_features),
                     "min_direction_coverage": float(np.nanmin(cov)) if np.isfinite(cov).any() else np.nan,
                     "mean_direction_coverage": float(np.nanmean(cov)) if np.isfinite(cov).any() else np.nan,
                     "backend": "kdtree",
                 }
             )
     return pd.DataFrame(rows)
-
 
 
 def _single_sample_vectors(
@@ -1869,17 +2131,18 @@ def _single_sample_vectors(
     min_coverage: float,
     workers: int,
     round_jaccard: int | None,
+    niche_features: Mapping[str, NicheResult],
 ) -> pd.DataFrame:
     if backend == "grid":
         return _single_sample_vectors_grid(
             adata, obs_idx, sample_name, target, features, steps, coord_cols,
             spatial_key, layer, grid_size, agg, cutoffs, quantile_cutoffs,
-            min_cells_per_bin, round_jaccard,
+            min_cells_per_bin, round_jaccard, niche_features,
         )
     return _single_sample_vectors_kdtree(
         adata, obs_idx, sample_name, target, features, steps, coord_cols,
         spatial_key, layer, radius, cutoffs, quantile_cutoffs, direction_mode,
-        min_coverage, workers, round_jaccard,
+        min_coverage, workers, round_jaccard, niche_features,
     )
 
 
@@ -1910,16 +2173,24 @@ def spatial_vector(
     min_coverage: float = 0.0,
     workers: int = 1,
     round_jaccard: int | None = 4,
+    niche_features: Mapping[str, NicheResult] | None = None,
 ) -> SpatialVectorResult:
-    """Generate SPHERE vectors for one tissue/sample with grid or KDTree backend.
+    """Generate SPHERE vectors for one tissue/sample.
+
+    ``niche_features`` maps selected target/feature names to ``NicheResult``
+    objects. For a mapped name, ``in_niche`` cell/grid identity replaces the
+    ordinary cutoff-derived positive identity before Jaccard calculations.
+    Unmapped names keep the legacy positive-cell/grid behavior.
 
     ``cutoff_method=None`` preserves the legacy sample-specific mean threshold.
     Cohort-wide methods are calculated at grid level for ``backend='grid'`` and
-    at cell level for ``backend='kdtree'``. Explicit ``cutoffs`` override any
-    calculated feature cutoff.
+    at cell level for ``backend='kdtree'``. KDTree is experimental in v0.4.0;
+    the regular-grid backend is recommended.
     """
     backend = str(backend).lower()
+    target = str(target)
     features = list(map(str, features))
+    niche_map = _normalize_niche_features(niche_features, [target, *features])
     steps = _normalize_backend_steps(backend, steps)
     if cutoff_method is not None and quantile_cutoffs is not None:
         raise ValueError("quantile_cutoffs and cutoff_method cannot be used together.")
@@ -1934,8 +2205,9 @@ def spatial_vector(
             raise ValueError(f"No observations found for {sample_key}={sample!r}.")
         sample_name = str(sample)
     cutoff_level = "grid" if backend == "grid" else "cell"
+    cutoff_features = [feature for feature in [target, *features] if feature not in niche_map]
     resolved_cutoffs, cutoff_result = _merge_calculated_cutoffs(
-        adata, [target, *features], cutoffs, cutoff_method, cutoff_level,
+        adata, cutoff_features, cutoffs, cutoff_method, cutoff_level,
         sample_key, cutoff_samples, coord_cols, spatial_key, layer, grid_size,
         agg, min_cells_per_bin, cutoff_n_repeats, cutoff_balance_round_to,
         cutoff_balance_n, cutoff_random_state,
@@ -1944,7 +2216,7 @@ def spatial_vector(
         adata, idx, sample_name, target, features, steps, coord_cols, spatial_key,
         layer, backend, grid_size, agg, resolved_cutoffs, quantile_cutoffs,
         min_cells_per_bin, radius, direction_mode, min_coverage, workers,
-        round_jaccard,
+        round_jaccard, niche_map,
     )
     projected = spatial_vec_proj(vectors)
     magnitude = spatial_vec_magnitude(vectors, features)
@@ -1981,6 +2253,9 @@ def spatial_vector(
             "cutoff_balance_round_to": cutoff_balance_round_to if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
             "cutoff_balance_n": cutoff_balance_n,
             "cutoff_random_state": cutoff_random_state if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
+            "binary_sources": {feature: _binary_source(feature, niche_map) for feature in [target, *features]},
+            "niche_features": list(niche_map),
+            "backend_status": "experimental" if backend == "kdtree" else "recommended",
         },
     )
 
@@ -2014,29 +2289,34 @@ def spatial_vector_x(
     workers: int = 1,
     round_jaccard: int | None = 4,
     verbose: bool = True,
+    niche_features: Mapping[str, NicheResult] | None = None,
 ) -> SpatialVectorResult:
     """Cohort-level SPHERE analysis using regular-grid or KDTree backend.
 
-    Use ``cutoff_method`` for one shared cutoff per feature across the cohort.
-    If ``cutoff_samples`` is omitted, the analyzed ``samples`` define the cutoff
-    cohort. Grid and KDTree automatically use grid-level and cell-level cutoff
-    calculation, respectively.
+    ``niche_features`` can replace any subset of target/features with their
+    precomputed ``in_niche`` identity. All other features still use the normal
+    cutoff-derived positive identity. Use ``cutoff_method`` for one shared
+    cutoff per unmapped feature across the cohort. KDTree is experimental; grid
+    is recommended for routine analysis.
     """
     backend = str(backend).lower()
+    target = str(target)
+    features = list(map(str, features))
+    niche_map = _normalize_niche_features(niche_features, [target, *features])
     steps = _normalize_backend_steps(backend, steps)
     if cutoff_method is not None and quantile_cutoffs is not None:
         raise ValueError("quantile_cutoffs and cutoff_method cannot be used together.")
     if sample_key not in adata.obs.columns:
         raise KeyError(f"sample_key {sample_key!r} not found in adata.obs.")
-    features = list(map(str, features))
     if samples is None:
         samples = list(pd.unique(adata.obs[sample_key].astype(str)))
     else:
         samples = list(map(str, samples))
     cutoff_cohort = list(map(str, cutoff_samples)) if cutoff_samples is not None else list(samples)
     cutoff_level = "grid" if backend == "grid" else "cell"
+    cutoff_features = [feature for feature in [target, *features] if feature not in niche_map]
     resolved_cutoffs, cutoff_result = _merge_calculated_cutoffs(
-        adata, [target, *features], cutoffs, cutoff_method, cutoff_level,
+        adata, cutoff_features, cutoffs, cutoff_method, cutoff_level,
         sample_key, cutoff_cohort, coord_cols, spatial_key, layer, grid_size, agg,
         min_cells_per_bin, cutoff_n_repeats, cutoff_balance_round_to,
         cutoff_balance_n, cutoff_random_state,
@@ -2056,7 +2336,7 @@ def spatial_vector_x(
                 adata, idx, sample, target, features, steps, coord_cols, spatial_key,
                 layer, backend, grid_size, agg, resolved_cutoffs, quantile_cutoffs,
                 min_cells_per_bin, radius, direction_mode, min_coverage, workers,
-                round_jaccard,
+                round_jaccard, niche_map,
             )
         )
     if not raw_parts:
@@ -2115,6 +2395,9 @@ def spatial_vector_x(
             "cutoff_balance_round_to": cutoff_balance_round_to if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
             "cutoff_balance_n": cutoff_balance_n,
             "cutoff_random_state": cutoff_random_state if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
+            "binary_sources": {feature: _binary_source(feature, niche_map) for feature in [target, *features]},
+            "niche_features": list(niche_map),
+            "backend_status": "experimental" if backend == "kdtree" else "recommended",
         },
     )
 
@@ -2147,12 +2430,13 @@ def pairwise_projected_scores(
     workers: int = 1,
     round_jaccard: int | None = 4,
     verbose: bool = True,
+    niche_features: Mapping[str, NicheResult] | None = None,
 ) -> PairwiseResult:
     """Figure-3A-like pairwise projected-score matrix for either backend.
 
-    ``cutoff_method`` applies the same cohort-wide cutoff for each feature to
-    every sample. Grid backend calculates those cutoffs on grid scores; KDTree
-    backend calculates them on cell/spot scores.
+    Features listed in ``niche_features`` use precomputed ``in_niche`` identity
+    as the binary object in every pair in which they appear. Other features use
+    cutoff-derived positivity. KDTree is experimental; grid is recommended.
     """
     backend = str(backend).lower()
     if backend not in {"grid", "kdtree"}:
@@ -2166,14 +2450,16 @@ def pairwise_projected_scores(
     if sample_key not in adata.obs.columns:
         raise KeyError(f"sample_key {sample_key!r} not found in adata.obs.")
     features = list(map(str, features))
+    niche_map = _normalize_niche_features(niche_features, features)
     if samples is None:
         samples = list(pd.unique(adata.obs[sample_key].astype(str)))
     else:
         samples = list(map(str, samples))
     cutoff_cohort = list(map(str, cutoff_samples)) if cutoff_samples is not None else list(samples)
     cutoff_level = "grid" if backend == "grid" else "cell"
+    cutoff_features = [feature for feature in features if feature not in niche_map]
     resolved_cutoffs, cutoff_result = _merge_calculated_cutoffs(
-        adata, features, cutoffs, cutoff_method, cutoff_level, sample_key,
+        adata, cutoff_features, cutoffs, cutoff_method, cutoff_level, sample_key,
         cutoff_cohort, coord_cols, spatial_key, layer, grid_size, agg,
         min_cells_per_bin, cutoff_n_repeats, cutoff_balance_round_to,
         cutoff_balance_n, cutoff_random_state,
@@ -2189,21 +2475,27 @@ def pairwise_projected_scores(
         coords = _resolve_coords(adata, idx, coord_cols=coord_cols, spatial_key=spatial_key)
         if backend == "grid":
             flat, counts, occupied, shape, _ = _make_grid(coords, grid_size, min_cells_per_bin)
-            grids = {}
-            thresholds = {}
+            binary_masks = {}
             for feature in features:
-                values = _resolve_feature_vector(adata, feature, idx, layer=layer)
-                grid = _aggregate_grid(values, flat, counts, shape, agg=agg)
-                grids[feature] = grid
-                thresholds[feature] = _choose_cutoff(feature, grid, occupied, resolved_cutoffs, quantile_cutoffs)
+                if feature in niche_map:
+                    binary_masks[feature] = _niche_grid_membership(
+                        niche_map[feature], sample, coords, occupied, grid_size
+                    )
+                else:
+                    values = _resolve_feature_vector(adata, feature, idx, layer=layer)
+                    grid = _aggregate_grid(values, flat, counts, shape, agg=agg)
+                    threshold = _choose_cutoff(
+                        feature, grid, occupied, resolved_cutoffs, quantile_cutoffs
+                    )
+                    binary_masks[feature] = occupied & np.isfinite(grid) & (grid > threshold)
             for target in features:
                 for feature in features:
                     if target == feature:
                         score = np.nan
                     else:
-                        stat = _cordstat_from_grids(
-                            grids[target], grids[feature], occupied,
-                            thresholds[target], thresholds[feature], int(round(float(final_step))),
+                        stat = _cordstat_from_binary_grids(
+                            binary_masks[target], binary_masks[feature], occupied,
+                            step=int(round(float(final_step))),
                             round_jaccard=round_jaccard,
                         )
                         d = stat["diff_pct"].to_numpy(dtype=float)
@@ -2213,10 +2505,17 @@ def pairwise_projected_scores(
             anchor_tree = cKDTree(coords)
             prepared = {}
             for feature in features:
-                values = _resolve_feature_vector(adata, feature, idx, layer=layer)
-                prepared[feature] = _kdtree_prepare_feature(
-                    coords, values, feature, radius, resolved_cutoffs, quantile_cutoffs, workers
-                )
+                if feature in niche_map:
+                    active = _niche_cell_membership(niche_map[feature], sample, idx)
+                    active, pos_coords, ftree, fdomain = _kdtree_prepare_binary(
+                        coords, active, radius, workers
+                    )
+                    prepared[feature] = (np.nan, active, pos_coords, ftree, fdomain)
+                else:
+                    values = _resolve_feature_vector(adata, feature, idx, layer=layer)
+                    prepared[feature] = _kdtree_prepare_feature(
+                        coords, values, feature, radius, resolved_cutoffs, quantile_cutoffs, workers
+                    )
             shifted_cache = {}
             for feature in features:
                 _, _, pos_coords, ftree, fdomain = prepared[feature]
@@ -2283,6 +2582,9 @@ def pairwise_projected_scores(
             "cutoff_balance_round_to": cutoff_balance_round_to if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
             "cutoff_balance_n": cutoff_balance_n,
             "cutoff_random_state": cutoff_random_state if cutoff_method and str(cutoff_method).startswith("balanced_global_") else None,
+            "binary_sources": {feature: _binary_source(feature, niche_map) for feature in features},
+            "niche_features": list(niche_map),
+            "backend_status": "experimental" if backend == "kdtree" else "recommended",
         },
     )
 
