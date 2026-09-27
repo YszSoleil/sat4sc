@@ -1,18 +1,400 @@
 # sat4sc
 
-`sat4sc` 是面向单细胞/亚细胞分辨率空间转录组的 Python 工具包。当前版本重点实现 `pysphere`：将 SPHERE 的空间位移思想重写为 Python/AnnData 工作流，并提供 regular-grid SPHERE、spatial niche、cohort-wide cutoff、pairwise projected score 以及相关可视化。
+`sat4sc` 是面向单细胞/亚细胞分辨率空间转录组的 Python 工具包。当前包含两个核心模块：`pysphere` 用于 SPHERE 空间位移/共定位分析；`state_niche` 用于基于 latent representation（推荐 `X_scVI`）构建 transcriptional-state spatial niche。
 
 ```python
 from sat4sc import pysphere, pysphere_plotting
+from sat4sc import state_niche, state_niche_plotting
 ```
 
-当前版本：**v0.4.0**
+当前版本：**v0.5.0**
 
 > 推荐使用 `backend="grid"`。`backend="kdtree"` 在 v0.4.0 中保留为**实验性功能**，适合需要 cell-resolved radius-domain 行为的探索性分析，但不建议作为常规默认 backend。
 
 ---
 
-## 1. v0.4.0 主要更新：SPHERE 可以直接使用 niche 身份
+## 1. v0.5.0 主要更新：Transcriptional-state niche
+
+v0.5.0 新增：
+
+```text
+sat4sc/state_niche.py
+sat4sc/state_niche_plotting.py
+```
+
+用于从单细胞空间转录组的 latent representation 中定义**局部转录状态空间生态位**。
+
+核心思想：
+
+```text
+每个中心细胞
+    ↓
+在同一 sample 内寻找最近 K 个空间邻居
+    ↓
+提取邻居 latent representation（推荐 X_scVI）
+    ↓
+对每个 latent dimension 计算 mean + std
+    ↓
+得到邻域 transcriptional-state representation
+    ↓
+StandardScaler
+    ↓
+Gaussian Mixture Model (GMM)
+    ↓
+State Niche
+```
+
+默认：
+
+```text
+K = 25
+include_center = False
+aggregations = ("mean", "std")
+```
+
+因此默认定义强调的是**中心细胞周围的 extrinsic transcriptional microenvironment**，而不是把中心细胞自身的 `X_scVI` 再次用于聚类。
+
+### 1.1 输入要求
+
+典型 AnnData：
+
+```python
+adata
+# obs:
+#   sample_name
+#   x_centroid
+#   y_centroid
+#   cell_type
+#   ...
+#
+# obsm:
+#   spatial
+#   X_scVI
+#   ...
+```
+
+`state_niche` 本身**不负责训练 scVI**；只要求指定的 latent representation 已经存在于 `adata.obsm`。因此也可以使用：
+
+```text
+X_scVI
+X_scANVI
+X_pca
+其他用户自定义低维 representation
+```
+
+### 1.2 构建 25-NN state-niche features
+
+```python
+from sat4sc import state_niche as sn
+
+feat = sn.build_features(
+    adata,
+    use_rep="X_scVI",
+    sample_key="sample_name",
+    spatial_key="spatial",
+    n_neighbors=25,
+    aggregations=("mean", "std"),
+    include_center=False,
+    scale=True,
+)
+```
+
+空间近邻会**按 `sample_name` 分别构建**，不会跨切片寻找邻居。
+
+如果 `adata.obsm["spatial"]` 不存在，会自动尝试：
+
+```python
+adata.obs[["x_centroid", "y_centroid"]]
+```
+
+默认写入：
+
+```python
+adata.obsm["X_state_niche_mean"]
+adata.obsm["X_state_niche_std"]
+adata.obsm["X_state_niche_raw"]
+adata.obsm["X_state_niche"]
+
+adata.obs["state_niche_knn25_rmax"]
+adata.obs["state_niche_knn25_rmean"]
+```
+
+其中：
+
+```text
+X_state_niche_raw = [neighbor_mean, neighbor_std]
+X_state_niche     = globally standardized X_state_niche_raw
+```
+
+如果 `X_scVI` 有 D 个 latent dimensions，则默认 state-niche representation 有 `2D` 维。
+
+### 1.3 为什么是 mean + std
+
+`mean` 描述局部邻域的平均 transcriptional state；`std` 描述邻域内部的 transcriptional heterogeneity。
+
+因此两个 cell-type composition 相似的区域，例如：
+
+```text
+A: LDHA+ Tumor + glycolytic/hypoxic Myeloid
+B: CCN3+ Tumor + GPR34+ relatively quiescent Myeloid
+```
+
+可能在传统 composition niche 中接近，但在 state-niche representation 中被分开。
+
+### 1.4 ClusterAutoK：重复 GMM + Fowlkes–Mallows stability
+
+```python
+autok = sn.ClusterAutoK(
+    n_clusters=(2, 20),
+    max_runs=10,
+    covariance_type="full",
+    random_state=123,
+)
+
+autok.fit(
+    adata,
+    use_rep="X_state_niche",
+    sample_key="sample_name",
+    max_cells_per_sample=10000,
+)
+```
+
+查看：
+
+```python
+autok.stability_
+autok.peaks_
+autok.best_k_
+```
+
+`ClusterAutoK` 是 **CellCharter-inspired stability scan**，但不是对 CellCharter 源码的直接复制。对每个候选 K 重复拟合 GMM，并使用 Fowlkes–Mallows index 比较不同随机初始化下的 clustering：
+
+```text
+within_stability
+    = 同一个 K 多次 GMM run 之间的平均 pairwise FMI
+```
+
+同时报告：
+
+```text
+prev_similarity  # K 与 K-1 的聚类结构相似度
+next_similarity  # K 与 K+1 的聚类结构相似度
+```
+
+`is_peak` 标记 within-K stability 的局部峰值；`best_k_` 是其中 stability 最高的候选值。如果没有严格局部峰值，则返回全局 stability 最大的 K。
+
+**不建议只凭 `best_k_` 机械选择最终 K。** 最终 K 还应同时检查：
+
+```text
+spatial coherence
+cross-sample recurrence
+biological interpretability
+over-fragmentation
+```
+
+### 1.5 约 60 万细胞时推荐 balanced GMM fitting
+
+对于 Xenium 等大数据，建议先对每个样本最多抽取固定数量细胞用于 AutoK/GMM fitting，再将模型预测到全部细胞：
+
+```python
+autok.fit(
+    adata,
+    use_rep="X_state_niche",
+    sample_key="sample_name",
+    max_cells_per_sample=10000,
+)
+```
+
+这样可以同时：
+
+```text
+1. 降低重复 GMM 的计算量
+2. 避免细胞数特别多的样本主导 GMM
+```
+
+fit set 会记录到：
+
+```python
+adata.obs["state_niche_fit_set"]
+```
+
+### 1.6 将候选 K 预测到所有细胞
+
+例如选 K=12：
+
+```python
+autok.predict(
+    adata,
+    k=12,
+    use_rep="X_state_niche",
+    key_added="state_niche",
+)
+```
+
+得到：
+
+```python
+adata.obs["state_niche"]
+adata.obs["state_niche_max_prob"]
+adata.obs["state_niche_entropy"]
+adata.obsm["X_state_niche_prob"]
+```
+
+其中 posterior probability / entropy 可用于识别 niche boundary 或 transition cells。
+
+### 1.7 已经确定 K 时一步运行
+
+如果已经决定使用固定 K：
+
+```python
+res = sn.state_niche(
+    adata,
+    use_rep="X_scVI",
+    sample_key="sample_name",
+    spatial_key="spatial",
+    n_neighbors=25,
+    aggregations=("mean", "std"),
+    include_center=False,
+    n_clusters=12,
+    max_cells_per_sample=10000,
+    key_added="state_niche",
+)
+```
+
+或者已经构建好 `X_state_niche` 后：
+
+```python
+res = sn.fit(
+    adata,
+    n_clusters=12,
+    use_rep="X_state_niche",
+    key_added="state_niche",
+    sample_key="sample_name",
+    max_cells_per_sample=10000,
+)
+```
+
+### 1.8 可视化
+
+```python
+from sat4sc import state_niche_plotting as snpl
+```
+
+稳定性曲线：
+
+```python
+ax = snpl.stability(autok)
+```
+
+空间分布：
+
+```python
+fig, axes = snpl.spatial(
+    adata,
+    cluster_key="state_niche",
+    sample_key="sample_name",
+)
+```
+
+每个 niche 的 cell-type composition：
+
+```python
+ax, table = snpl.composition(
+    adata,
+    cluster_key="state_niche",
+    celltype_key="cell_type",
+)
+```
+
+每个 sample 的 niche composition：
+
+```python
+ax, table = snpl.sample_composition(
+    adata,
+    cluster_key="state_niche",
+    sample_key="sample_name",
+)
+```
+
+### 1.9 推荐的完整工作流
+
+```python
+from sat4sc import state_niche as sn
+from sat4sc import state_niche_plotting as snpl
+
+# 1. 构建 neighborhood transcriptional-state representation
+sn.build_features(
+    adata,
+    use_rep="X_scVI",
+    sample_key="sample_name",
+    spatial_key="spatial",
+    n_neighbors=25,
+    aggregations=("mean", "std"),
+)
+
+# 2. AutoK
+model = sn.ClusterAutoK(
+    n_clusters=(2, 20),
+    max_runs=10,
+    covariance_type="full",
+    random_state=123,
+)
+
+model.fit(
+    adata,
+    use_rep="X_state_niche",
+    sample_key="sample_name",
+    max_cells_per_sample=10000,
+)
+
+print(model.stability_)
+print("stability peaks:", model.peaks_)
+print("suggested K:", model.best_k_)
+
+# 3. 人工结合 stability + spatial pattern + biology 选择最终 K
+selected_k = model.best_k_
+
+# 4. 预测全数据
+model.predict(
+    adata,
+    k=selected_k,
+    key_added="state_niche",
+)
+
+# 5. 可视化
+snpl.stability(model)
+snpl.spatial(adata, cluster_key="state_niche")
+snpl.composition(
+    adata,
+    cluster_key="state_niche",
+    celltype_key="cell_type",
+)
+```
+
+### 1.10 推荐 sensitivity analyses
+
+正式分析建议至少比较：
+
+```text
+KNN = 10 / 25 / 50
+mean-only vs mean+std
+neighbor-only vs center-inclusive
+balanced-fit vs all-cell fit
+不同 stability peak 对应的 cluster solution
+```
+
+特别是 `25-NN` 在不同细胞密度区域对应的物理尺度可能不同，因此建议查看：
+
+```python
+adata.obs["state_niche_knn25_rmax"]
+adata.obs["state_niche_knn25_rmean"]
+```
+
+确认不同样本和组织区域的空间尺度是否合理。
+
+---
+
+## 2. v0.4.0：SPHERE 可以直接使用 niche 身份
 
 v0.3.x 中，SPHERE 的 binary spatial object 主要来自：
 
@@ -69,7 +451,7 @@ pysphere.kdtree_domain_map()   # experimental KDTree utility
 
 ---
 
-## 2. 最常用的新用法
+## 3. 最常用的新用法
 
 ### 2.1 先定义多个 niche
 
@@ -172,7 +554,7 @@ rs = pysphere.spatial_vector_x(
 
 ---
 
-## 3. pairwise projected-score matrix 中使用 niche
+## 4. pairwise projected-score matrix 中使用 niche
 
 `pairwise_projected_scores()` 同样支持一个或多个 feature 使用 niche 身份。
 
@@ -213,7 +595,7 @@ positive vs positive
 
 ---
 
-## 4. 输出如何区分 positive 与 niche source
+## 5. 输出如何区分 positive 与 niche source
 
 `spatial_vector()` / `spatial_vector_x()` 的 raw vector 表中新增：
 
@@ -262,7 +644,7 @@ rs.settings["backend_status"]
 
 ---
 
-## 5. niche 与 SPHERE grid 必须使用相同空间几何
+## 6. niche 与 SPHERE grid 必须使用相同空间几何
 
 当 `backend="grid"` 且使用 `niche_features` 时，sat4sc 会进行严格检查。
 
@@ -304,7 +686,7 @@ rs = pysphere.spatial_vector_x(
 
 ---
 
-## 6. spatial niche 定义
+## 7. spatial niche 定义
 
 niche 的基本流程仍然是：
 
@@ -391,7 +773,7 @@ hypoxia_niche.sample_results["sample01"].cell_niche
 
 ---
 
-## 7. cohort-wide cutoff
+## 8. cohort-wide cutoff
 
 普通 positive cell/grid 仍可使用 cohort-wide cutoff：
 
@@ -418,7 +800,7 @@ balanced_global_mean
 
 ---
 
-## 8. regular-grid SPHERE（推荐）
+## 9. regular-grid SPHERE（推荐）
 
 Xenium / CosMx / MERFISH 等数据通常使用连续 cell centroid 坐标。`backend="grid"` 会先把细胞投影到规则二维 grid，再执行 8 方向位移。
 
@@ -476,7 +858,7 @@ rs_grid.sample_vector_len
 
 ---
 
-## 9. SPHERE 的共同统计量
+## 10. SPHERE 的共同统计量
 
 固定对象 A，将对象 B 沿 8 个方向移动，在每个 step 计算：
 
@@ -515,7 +897,7 @@ in_niche grid/cell
 
 ---
 
-## 10. KDTree backend：实验性功能
+## 11. KDTree backend：实验性功能
 
 `backend="kdtree"` 保留连续 cell coordinates，并把 active cells（普通 positive cells 或 v0.4.0 的 in-niche cells）扩展为 radius-defined occupancy domain，再做空间位移和 Jaccard 计算。
 
@@ -545,7 +927,7 @@ niche feature → in_niche cells → KDTree radius domain
 
 ---
 
-## 11. 输入 AnnData
+## 12. 输入 AnnData
 
 典型输入：
 
@@ -580,7 +962,7 @@ adata.obsm["spatial"]
 
 ---
 
-## 12. 安装
+## 13. 安装
 
 在仓库根目录：
 
@@ -591,9 +973,12 @@ pip install -e .
 然后：
 
 ```python
-from sat4sc import pysphere, pysphere_plotting
+from sat4sc import (
+    pysphere, pysphere_plotting,
+    state_niche, state_niche_plotting,
+)
 print(__import__("sat4sc").__version__)
-# 0.4.0
+# 0.5.0
 ```
 
 依赖：
@@ -604,11 +989,36 @@ pandas >= 2.0
 scipy >= 1.10
 anndata >= 0.10
 matplotlib >= 3.7
+scikit-learn >= 1.3
 ```
 
 ---
 
-## 13. 主要函数概览
+## 14. 主要函数概览
+
+### transcriptional-state niche
+
+```python
+from sat4sc import state_niche
+
+state_niche.build_spatial_neighbors()
+state_niche.build_features()
+state_niche.balanced_fit_indices()
+state_niche.ClusterAutoK()
+state_niche.fit()
+state_niche.state_niche()
+```
+
+### state-niche plotting
+
+```python
+from sat4sc import state_niche_plotting
+
+state_niche_plotting.stability()
+state_niche_plotting.spatial()
+state_niche_plotting.composition()
+state_niche_plotting.sample_composition()
+```
 
 ### SPHERE / spatial calculation
 
@@ -650,7 +1060,7 @@ from sat4sc import pysphere_plotting
 
 ---
 
-## 14. v0.4.0 向后兼容性
+## 15. v0.4.0 向后兼容性
 
 旧代码：
 
@@ -682,7 +1092,7 @@ niche_features={...}
 
 ---
 
-## 15. 推荐 workflow
+## 16. 推荐 workflow
 
 ```python
 from sat4sc import pysphere, pysphere_plotting
