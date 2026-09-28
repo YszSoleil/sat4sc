@@ -15,40 +15,187 @@ from .state_niche import ClusterAutoK, DEFAULT_COORD_COLS, DEFAULT_SPATIAL_KEY
 def stability(
     autok: ClusterAutoK,
     *,
-    ax=None,
+    metric: str | None = None,
+    statistic: str = "mean",
+    show_iqr: bool = True,
     show_adjacent: bool = False,
     annotate_peaks: bool = True,
-    title: str = "State-niche GMM stability",
+    ax=None,
+    title: str | None = None,
 ):
-    """Plot repeated-GMM Fowlkes-Mallows stability across candidate K."""
+    """Plot one repeated-run stability metric across candidate K.
+
+    Parameters
+    ----------
+    metric
+        One of ``'ari'``, ``'nmi'`` or ``'fmi'``. If omitted, the model's
+        ``primary_metric`` is used.
+    statistic
+        ``'mean'`` or ``'median'`` summary across all pairwise run comparisons.
+    show_iqr
+        Shade the Q1-Q3 interval across all pairwise run comparisons.
+    show_adjacent
+        For FMI only, additionally draw the legacy K-1/K+1 continuity curves.
+
+    Notes
+    -----
+    ARI/NMI/FMI are repeated-run stability metrics. Silhouette is deliberately
+    plotted by :func:`silhouette` instead because it measures separation rather
+    than stability.
+    """
 
     if autok.stability_ is None:
         raise RuntimeError("autok.fit(...) must be called before plotting stability.")
+    metric = autok.primary_metric if metric is None else str(metric).lower()
+    if metric not in {"ari", "nmi", "fmi"}:
+        raise ValueError("metric must be one of 'ari', 'nmi', or 'fmi'.")
+    statistic = str(statistic).lower()
+    if statistic not in {"mean", "median"}:
+        raise ValueError("statistic must be 'mean' or 'median'.")
+
     df = autok.stability_
+    ycol = f"{metric}_{statistic}"
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(df["k"], df["stability"], marker="o", label="within-K stability")
+    ax.plot(
+        df["k"], df[ycol], marker="o",
+        label=f"{metric.upper()} {statistic}",
+    )
+    if show_iqr:
+        ax.fill_between(
+            df["k"].to_numpy(),
+            df[f"{metric}_q25"].to_numpy(),
+            df[f"{metric}_q75"].to_numpy(),
+            alpha=0.18,
+            label=f"{metric.upper()} IQR",
+        )
     if show_adjacent:
-        ax.plot(df["k"], df["prev_similarity"], marker=".", label="similarity to K-1")
-        ax.plot(df["k"], df["next_similarity"], marker=".", label="similarity to K+1")
-    if annotate_peaks:
+        if metric != "fmi":
+            raise ValueError("show_adjacent=True is only defined for FMI.")
+        ax.plot(df["k"], df["prev_similarity"], marker=".", label="FMI to K-1")
+        ax.plot(df["k"], df["next_similarity"], marker=".", label="FMI to K+1")
+
+    if annotate_peaks and metric == autok.primary_metric:
         peaks = df[df["is_peak"]]
-        ax.scatter(peaks["k"], peaks["stability"], s=70, zorder=3, label="local peak")
+        ax.scatter(peaks["k"], peaks[ycol], s=70, zorder=3, label="local peak")
         for row in peaks.itertuples(index=False):
             ax.annotate(
                 f"K={int(row.k)}",
-                (row.k, row.stability),
+                (row.k, getattr(row, ycol)),
                 xytext=(4, 6),
                 textcoords="offset points",
                 fontsize=9,
             )
     ax.set_xlabel("Number of GMM clusters (K)")
-    ax.set_ylabel("Fowlkes–Mallows stability")
+    ax.set_ylabel(f"{metric.upper()} repeated-run agreement")
+    if title is None:
+        title = f"State-niche GMM stability ({metric.upper()})"
     ax.set_title(title)
-    ax.set_ylim(0, 1.02)
+    ax.set_ylim(-0.05 if metric == "ari" else 0.0, 1.02)
     ax.legend(frameon=False)
     return ax
 
+
+def stability_metrics(
+    autok: ClusterAutoK,
+    *,
+    metrics: Sequence[str] = ("ari", "nmi", "fmi"),
+    statistic: str = "mean",
+    ax=None,
+    title: str = "Repeated-GMM clustering stability",
+):
+    """Overlay ARI, NMI and/or FMI summaries across K."""
+
+    if autok.stability_ is None:
+        raise RuntimeError("autok.fit(...) must be called before plotting stability.")
+    statistic = str(statistic).lower()
+    if statistic not in {"mean", "median"}:
+        raise ValueError("statistic must be 'mean' or 'median'.")
+    metrics = tuple(str(x).lower() for x in metrics)
+    bad = sorted(set(metrics) - {"ari", "nmi", "fmi"})
+    if bad:
+        raise ValueError(f"Unsupported metrics: {bad}.")
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7.5, 4.8))
+    df = autok.stability_
+    for metric in metrics:
+        ax.plot(
+            df["k"],
+            df[f"{metric}_{statistic}"],
+            marker="o",
+            label=f"{metric.upper()} {statistic}",
+        )
+    ax.set_xlabel("Number of GMM clusters (K)")
+    ax.set_ylabel("Pairwise repeated-run agreement")
+    ax.set_title(title)
+    ax.set_ylim(-0.05 if "ari" in metrics else 0.0, 1.02)
+    ax.legend(frameon=False)
+    return ax
+
+
+def silhouette(
+    autok: ClusterAutoK,
+    *,
+    statistic: str = "mean",
+    ax=None,
+    title: str = "GMM cluster separation across K",
+):
+    """Plot silhouette as a separation/compactness diagnostic, not stability."""
+
+    if autok.stability_ is None:
+        raise RuntimeError("autok.fit(...) must be called before plotting silhouette.")
+    if autok.silhouette_mode is None:
+        raise RuntimeError(
+            "No silhouette values are available. Fit ClusterAutoK with "
+            "silhouette_mode='representative' or 'all_runs'."
+        )
+    statistic = str(statistic).lower()
+    if statistic not in {"mean", "median"}:
+        raise ValueError("statistic must be 'mean' or 'median'.")
+    df = autok.stability_
+    ycol = "silhouette" if autok.silhouette_mode == "representative" else f"silhouette_{statistic}"
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(df["k"], df[ycol], marker="o")
+    if autok.silhouette_mode == "all_runs":
+        ax.fill_between(
+            df["k"].to_numpy(),
+            df["silhouette_q25"].to_numpy(),
+            df["silhouette_q75"].to_numpy(),
+            alpha=0.18,
+        )
+    ax.set_xlabel("Number of GMM clusters (K)")
+    ax.set_ylabel("Silhouette score")
+    ax.set_title(title)
+    return ax
+
+
+def pairwise_stability_boxplot(
+    autok: ClusterAutoK,
+    *,
+    metric: str = "ari",
+    ax=None,
+    title: str | None = None,
+):
+    """Boxplot of all pairwise repeated-run agreement values for each K."""
+
+    if autok.pairwise_metrics_ is None:
+        raise RuntimeError("autok.fit(...) must be called before plotting stability.")
+    metric = str(metric).lower()
+    if metric not in {"ari", "nmi", "fmi"}:
+        raise ValueError("metric must be one of 'ari', 'nmi', or 'fmi'.")
+    df = autok.pairwise_metrics_
+    ks = sorted(df["k"].unique())
+    values = [df.loc[df["k"] == k, metric].to_numpy() for k in ks]
+    if ax is None:
+        _, ax = plt.subplots(figsize=(max(8, 0.5 * len(ks)), 4.8))
+    ax.boxplot(values, labels=[str(k) for k in ks], showfliers=False)
+    ax.set_xlabel("Number of GMM clusters (K)")
+    ax.set_ylabel(metric.upper())
+    if title is None:
+        title = f"Pairwise repeated-run {metric.upper()} by K"
+    ax.set_title(title)
+    return ax
 
 def _coords_from_adata(adata, spatial_key, coord_cols):
     if spatial_key in adata.obsm:
@@ -187,4 +334,12 @@ def sample_composition(
     return ax, tab
 
 
-__all__ = ["stability", "spatial", "composition", "sample_composition"]
+__all__ = [
+    "stability",
+    "stability_metrics",
+    "silhouette",
+    "pairwise_stability_boxplot",
+    "spatial",
+    "composition",
+    "sample_composition",
+]

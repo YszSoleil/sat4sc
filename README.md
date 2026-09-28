@@ -7,9 +7,310 @@ from sat4sc import pysphere, pysphere_plotting
 from sat4sc import state_niche, state_niche_plotting
 ```
 
-当前版本：**v0.5.0**
+当前版本：**v0.6.0**
 
 > 推荐使用 `backend="grid"`。`backend="kdtree"` 在 v0.4.0 中保留为**实验性功能**，适合需要 cell-resolved radius-domain 行为的探索性分析，但不建议作为常规默认 backend。
+
+---
+
+## 0. v0.6.0 主要更新：更完整的 GMM stability evaluation
+
+v0.6.0 在 v0.5.0 的 `state_niche.ClusterAutoK` 基础上补充了更规范的重复聚类稳定性评估，同时保留原有 CellCharter-inspired Fowlkes–Mallows（FMI）框架。
+
+对于每一个候选 cluster number：
+
+```text
+K = 2, 3, ..., 20
+```
+
+均可以使用多个不同 random seed 重复运行 GMM。对同一 K 的所有重复结果，sat4sc 现在会保存全部 pairwise：
+
+```text
+Adjusted Rand Index (ARI)               # 推荐作为主要 repeated-run stability 指标
+Normalized Mutual Information (NMI)    # 辅助 stability 指标
+Fowlkes–Mallows index (FMI)             # v0.5 原有指标，继续保留
+```
+
+并对每一个 K 汇总：
+
+```text
+mean
+median
+SD
+Q1 / Q3
+IQR
+```
+
+`silhouette score` 也可以计算，但在 sat4sc 中明确作为：
+
+> **cluster separation / compactness diagnostic**
+
+而不是 clustering stability 指标。
+
+### 0.1 推荐的一步 stability scan
+
+如果希望严格按照“ARI 为主要 stability、NMI 为辅助、保留 FMI、silhouette 单独解释”的方案运行：
+
+```python
+from sat4sc import state_niche as sn
+
+model = sn.scan_cluster_stability(
+    adata,
+    use_rep="X_state_niche",
+    n_clusters=(2, 20),
+    max_runs=10,
+    primary_metric="ari",
+    silhouette_mode="representative",
+    silhouette_sample_size=5000,
+    covariance_type="full",
+    random_state=123,
+    sample_key="sample_name",
+    max_cells_per_sample=10000,
+    predict_all_k=True,
+    output_dir="state_niche_stability",
+)
+```
+
+这里：
+
+```text
+primary_metric="ari"
+```
+
+意味着：
+
+```text
+stability = mean pairwise ARI
+local stability peaks 基于 ARI
+best_k_ 基于 ARI stability peak
+representative run 也优先依据 ARI 选择
+```
+
+但 FMI 和 NMI 不会被丢弃。
+
+### 0.2 保存的 stability 表格
+
+运行后：
+
+```python
+model.pairwise_metrics_
+```
+
+为 long-format 表格，每一行对应同一个 K 下的一对 repeated runs，例如：
+
+```text
+k
+run_i
+run_j
+seed_i
+seed_j
+fmi
+ari
+nmi
+```
+
+如果：
+
+```text
+K = 2..20      -> 19 个 K
+max_runs = 10  -> 每个 K 有 C(10,2)=45 个 pair
+```
+
+则共保存：
+
+```text
+19 × 45 = 855
+```
+
+个 pairwise stability comparisons。
+
+汇总表：
+
+```python
+model.stability_
+```
+
+包含例如：
+
+```text
+ari_mean
+ari_median
+ari_sd
+ari_q25
+ari_q75
+ari_iqr
+
+nmi_mean
+nmi_median
+nmi_sd
+nmi_q25
+nmi_q75
+nmi_iqr
+
+fmi_mean
+fmi_median
+fmi_sd
+fmi_q25
+fmi_q75
+fmi_iqr
+
+silhouette
+prev_similarity
+next_similarity
+representative_run
+representative_seed
+n_runs
+n_pairs
+stability
+is_peak
+```
+
+其中：
+
+```text
+within_stability = fmi_mean
+```
+
+仍保留用于兼容 v0.5.0 输出。
+
+### 0.3 自动保存 CSV
+
+```python
+model.save_results(
+    "state_niche_stability",
+    prefix="state_niche",
+)
+```
+
+生成：
+
+```text
+state_niche_stability_summary.csv
+state_niche_pairwise_stability.csv
+state_niche_run_metrics.csv
+```
+
+`scan_cluster_stability(..., output_dir=...)` 会自动执行相同操作。
+
+### 0.4 保存 K=2..20 每个 K 的 representative clustering
+
+如果需要实际检查所有 K，而不是只看 `best_k_`：
+
+```python
+all_k = model.predict_all_k(
+    adata,
+    key_prefix="state_niche_k",
+)
+```
+
+会生成：
+
+```text
+adata.obs["state_niche_k2"]
+adata.obs["state_niche_k3"]
+...
+adata.obs["state_niche_k20"]
+```
+
+每个 K 使用该 K 下最能代表重复聚类共识的 GMM run。默认不会为 19 个 K 全部保存 posterior probability，以避免大规模 Xenium 数据出现非常高的内存占用。
+
+### 0.5 可视化 ARI / NMI / FMI
+
+```python
+from sat4sc import state_niche_plotting as snpl
+```
+
+ARI stability + IQR：
+
+```python
+snpl.stability(
+    model,
+    metric="ari",
+    statistic="mean",
+    show_iqr=True,
+)
+```
+
+三种 repeated-run stability metric 同时比较：
+
+```python
+snpl.stability_metrics(
+    model,
+    metrics=("ari", "nmi", "fmi"),
+)
+```
+
+查看每个 K 的所有 pairwise ARI 分布：
+
+```python
+snpl.pairwise_stability_boxplot(
+    model,
+    metric="ari",
+)
+```
+
+silhouette 单独绘制：
+
+```python
+snpl.silhouette(model)
+```
+
+这样可以避免把 silhouette 与 repeated-run stability 混为一谈。
+
+### 0.6 silhouette 的推荐计算方式
+
+对于约 60 万细胞的 Xenium 数据，不推荐对所有 cells、所有 random seeds 都完整计算 silhouette，因为 silhouette 的 pairwise distance 计算代价很高。
+
+推荐：
+
+```python
+silhouette_mode="representative"
+silhouette_sample_size=5000
+```
+
+即每个 K 只对其 representative run 计算一次 sampled silhouette。
+
+如果数据量较小并希望查看重复 run 之间的 silhouette 分布，可以使用：
+
+```python
+silhouette_mode="all_runs"
+```
+
+但无论使用哪一种方式：
+
+> **silhouette 仅用于评估 cluster separation / compactness，不用于定义 repeated-run clustering stability。**
+
+### 0.7 兼容原有 FMI stability
+
+如果希望完全保持 v0.5.0 的 cluster-number selection 行为：
+
+```python
+model = sn.ClusterAutoK(
+    n_clusters=(2, 20),
+    max_runs=10,
+    primary_metric="fmi",
+)
+```
+
+如果希望新分析中 ARI 为主要 stability 指标：
+
+```python
+model = sn.ClusterAutoK(
+    n_clusters=(2, 20),
+    max_runs=10,
+    primary_metric="ari",
+)
+```
+
+因此 v0.6.0 没有删除原方法，而是在原有 FMI framework 上增加 ARI/NMI 和明确分离的 silhouette diagnostic。
+
+### 0.8 解释 stability 时的两个注意点
+
+1. **推荐 stability scan 保持 `n_init=1`。** `max_runs=10` 已经显式表示 10 个不同 random seed 的独立 GMM 拟合；如果同时把单次 GMM 的 `n_init` 设得很大，每个 run 又会在内部挑选最佳初始化，可能使不同 run 看起来更稳定，并增加大量计算。最终固定 K 拟合时再根据需要提高 `n_init`。
+
+2. **不要机械选择 ARI 最大的 K。** 较粗的低 K partition 本来就可能更容易在不同初始化下保持一致。`best_k_` 只是稳定性候选，应同时检查 spatial coherence、cross-sample recurrence、silhouette/separation、cluster size、over-fragmentation 和 biological interpretability。
+
+另外，这里的 repeated-seed ARI/NMI/FMI 主要衡量 **optimization / initialization stability**；它不能替代基于样本重采样或独立 cohort 的 biological robustness validation。
 
 ---
 
@@ -978,7 +1279,7 @@ from sat4sc import (
     state_niche, state_niche_plotting,
 )
 print(__import__("sat4sc").__version__)
-# 0.5.0
+# 0.6.0
 ```
 
 依赖：
@@ -1005,6 +1306,7 @@ state_niche.build_spatial_neighbors()
 state_niche.build_features()
 state_niche.balanced_fit_indices()
 state_niche.ClusterAutoK()
+state_niche.scan_cluster_stability()
 state_niche.fit()
 state_niche.state_niche()
 ```
@@ -1015,6 +1317,9 @@ state_niche.state_niche()
 from sat4sc import state_niche_plotting
 
 state_niche_plotting.stability()
+state_niche_plotting.stability_metrics()
+state_niche_plotting.pairwise_stability_boxplot()
+state_niche_plotting.silhouette()
 state_niche_plotting.spatial()
 state_niche_plotting.composition()
 state_niche_plotting.sample_composition()

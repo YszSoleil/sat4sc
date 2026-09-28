@@ -20,15 +20,18 @@ emphasizes the transcriptional state of the surrounding microenvironment
 rather than re-clustering the centre cell by its own identity.
 
 The automatic cluster-number scan is CellCharter-inspired rather than a direct
-reimplementation. It reports repeated-run Fowlkes-Mallows stability at each K
-and identifies local stability peaks. The exact score definition is documented
-in :class:`ClusterAutoK` and stored in ``stability_``.
+reimplementation. The original Fowlkes-Mallows stability is retained, while
+v0.6 additionally reports pairwise Adjusted Rand Index (ARI) and Normalized
+Mutual Information (NMI) across repeated GMM runs. Silhouette can be computed
+separately as a cluster-separation diagnostic and is never treated as a
+repeated-run stability metric. See :class:`ClusterAutoK`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import combinations
+from pathlib import Path
 from typing import Iterable, Sequence
 import warnings
 
@@ -36,7 +39,12 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 from sklearn.mixture import GaussianMixture
-from sklearn.metrics import fowlkes_mallows_score
+from sklearn.metrics import (
+    adjusted_rand_score,
+    fowlkes_mallows_score,
+    normalized_mutual_info_score,
+    silhouette_score,
+)
 from sklearn.preprocessing import StandardScaler
 
 try:
@@ -588,33 +596,63 @@ def fit(
 class ClusterAutoK:
     """Repeated-GMM cluster-number stability scan.
 
-    This class is **CellCharter-inspired**. For every candidate number of
-    clusters ``K``, multiple GMMs are fitted with different random seeds.
-    Stability is quantified with the Fowlkes-Mallows index (FMI), which is
-    label-permutation invariant.
+    The original sat4sc v0.5 implementation used repeated-run
+    Fowlkes-Mallows index (FMI) as the CellCharter-inspired stability metric.
+    v0.6 keeps that metric for backward compatibility and additionally
+    computes pairwise Adjusted Rand Index (ARI) and Normalized Mutual
+    Information (NMI) for every pair of repeated GMM runs at each K.
 
-    The table ``stability_`` contains:
+    Parameters
+    ----------
+    n_clusters
+        Candidate cluster numbers. A two-element tuple is interpreted as an
+        inclusive range, e.g. ``(2, 20)`` -> K=2,...,20.
+    max_runs
+        Number of repeated GMM fits for every K. Each run uses a distinct,
+        reproducible random seed derived from ``random_state``.
+    primary_metric
+        Metric used for ``stability``, local-peak detection, ``best_k_`` and
+        representative-run selection. One of ``{'fmi', 'ari', 'nmi'}``.
+        Default ``'fmi'`` preserves v0.5 behaviour. For workflows that define
+        clustering stability primarily by ARI, use ``primary_metric='ari'``.
+    silhouette_mode
+        Silhouette is a *cluster separation/compactness* diagnostic, not a
+        stability metric. ``None`` disables it. ``'representative'`` computes
+        one silhouette score per K for the representative repeated run.
+        ``'all_runs'`` computes it for every repeated run and summarizes the
+        distribution. The representative mode is usually preferable for
+        large spatial datasets.
+    silhouette_sample_size
+        Maximum number of fit cells used for each silhouette calculation.
+        ``None`` uses all fit cells. Sampling is only for silhouette and does
+        not affect GMM fitting or ARI/NMI/FMI stability.
 
-    ``within_stability``
-        Mean pairwise FMI between repeated runs at the same K.
+    Attributes
+    ----------
+    pairwise_metrics_ : pandas.DataFrame
+        Long-format table containing every run-pair at every K with ``fmi``,
+        ``ari`` and ``nmi`` values, plus run indices and random seeds.
+    run_metrics_ : pandas.DataFrame
+        Per-run GMM diagnostics (seed, convergence, lower bound, iterations)
+        and optional silhouette values.
+    stability_ : pandas.DataFrame
+        Per-K summary. For each FMI/ARI/NMI metric, mean, median, SD, Q1, Q3
+        and IQR are reported. ``stability`` equals the mean of
+        ``primary_metric``. ``within_stability`` remains the mean FMI for
+        backward compatibility. Legacy K-1/K+1 FMI continuity diagnostics are
+        retained as ``prev_similarity`` and ``next_similarity``.
 
-    ``prev_similarity`` / ``next_similarity``
-        Mean best-match FMI between runs at K and runs at K-1 / K+1. These are
-        descriptive continuity diagnostics, not subtracted from the primary
-        within-K score.
-
-    ``stability``
-        Alias of ``within_stability``; used for peak detection.
-
-    ``is_peak``
-        Local maxima of the stability curve. Edge K values are not declared
-        peaks unless only one K is supplied.
-
-    ``best_k_`` is the peak with the highest stability. If no strict local peak
-    exists, the globally most stable K is returned. Biological interpretability,
-    spatial coherence and cross-sample recurrence should still be considered
-    before selecting a final K.
+    Notes
+    -----
+    ARI/NMI/FMI quantify agreement between repeated clusterings and are valid
+    stability diagnostics because they compare partitions across runs.
+    Silhouette compares within-cluster compactness with between-cluster
+    separation for a single partition; it must not be interpreted as a
+    repeated-run stability metric.
     """
+
+    _VALID_PRIMARY = {"fmi", "ari", "nmi"}
+    _VALID_SILHOUETTE = {None, "representative", "all_runs"}
 
     def __init__(
         self,
@@ -626,6 +664,10 @@ class ClusterAutoK:
         max_iter: int = 200,
         random_state: int = 123,
         n_init: int = 1,
+        primary_metric: str = "fmi",
+        silhouette_mode: str | None = None,
+        silhouette_sample_size: int | None = 5000,
+        silhouette_metric: str = "euclidean",
     ) -> None:
         if isinstance(n_clusters, tuple) and len(n_clusters) == 2:
             lo, hi = map(int, n_clusters)
@@ -639,6 +681,18 @@ class ClusterAutoK:
         if max_runs < 2:
             raise ValueError("max_runs must be >=2 to estimate repeated-run stability.")
 
+        primary_metric = str(primary_metric).lower()
+        if primary_metric not in self._VALID_PRIMARY:
+            raise ValueError(
+                f"primary_metric must be one of {sorted(self._VALID_PRIMARY)}."
+            )
+        if silhouette_mode not in self._VALID_SILHOUETTE:
+            raise ValueError(
+                "silhouette_mode must be None, 'representative', or 'all_runs'."
+            )
+        if silhouette_sample_size is not None and silhouette_sample_size < 2:
+            raise ValueError("silhouette_sample_size must be >=2 or None.")
+
         self.n_clusters = ks
         self.max_runs = int(max_runs)
         self.covariance_type = covariance_type
@@ -646,9 +700,16 @@ class ClusterAutoK:
         self.max_iter = int(max_iter)
         self.random_state = int(random_state)
         self.n_init = int(n_init)
+        self.primary_metric = primary_metric
+        self.silhouette_mode = silhouette_mode
+        self.silhouette_sample_size = silhouette_sample_size
+        self.silhouette_metric = silhouette_metric
 
         self.models_: dict[int, list[GaussianMixture]] = {}
         self.labels_: dict[int, list[np.ndarray]] = {}
+        self.seeds_: dict[int, list[int]] = {}
+        self.pairwise_metrics_: pd.DataFrame | None = None
+        self.run_metrics_: pd.DataFrame | None = None
         self.stability_: pd.DataFrame | None = None
         self.best_k_: int | None = None
         self.peaks_: list[int] = []
@@ -656,16 +717,38 @@ class ClusterAutoK:
         self.use_rep_: str | None = None
         self._x_fit: np.ndarray | None = None
 
+    def _seed_table(self) -> dict[int, list[int]]:
+        """Create deterministic distinct seeds for all K/run combinations."""
+
+        total = len(self.n_clusters) * self.max_runs
+        ss = np.random.SeedSequence(self.random_state)
+        children = ss.spawn(total)
+        raw: list[int] = []
+        seen: set[int] = set()
+        modulus = int(np.iinfo(np.uint32).max)
+        for child in children:
+            seed = int(child.generate_state(1, dtype=np.uint32)[0])
+            while seed in seen:
+                seed = (seed + 1) % modulus
+            seen.add(seed)
+            raw.append(seed)
+        out: dict[int, list[int]] = {}
+        offset = 0
+        for k in self.n_clusters:
+            out[k] = raw[offset : offset + self.max_runs]
+            offset += self.max_runs
+        return out
+
     def _fit_matrix(self, x_fit: np.ndarray) -> None:
-        rng = np.random.default_rng(self.random_state)
         self.models_.clear()
         self.labels_.clear()
+        self.seeds_ = self._seed_table()
+        run_rows: list[dict] = []
 
         for k in self.n_clusters:
             models: list[GaussianMixture] = []
             labels: list[np.ndarray] = []
-            seeds = rng.integers(0, np.iinfo(np.int32).max, size=self.max_runs)
-            for seed in seeds:
+            for run_idx, seed in enumerate(self.seeds_[k]):
                 model = GaussianMixture(
                     n_components=k,
                     covariance_type=self.covariance_type,
@@ -675,23 +758,77 @@ class ClusterAutoK:
                     random_state=int(seed),
                 )
                 model.fit(x_fit)
+                lab = model.predict(x_fit).astype(np.int32)
                 models.append(model)
-                labels.append(model.predict(x_fit).astype(np.int32))
+                labels.append(lab)
+                run_rows.append(
+                    {
+                        "k": int(k),
+                        "run": int(run_idx),
+                        "seed": int(seed),
+                        "converged": bool(model.converged_),
+                        "n_iter": int(model.n_iter_),
+                        "lower_bound": float(model.lower_bound_),
+                        "silhouette": np.nan,
+                    }
+                )
             self.models_[k] = models
             self.labels_[k] = labels
 
+        self.run_metrics_ = pd.DataFrame(run_rows)
+
+    def _build_pairwise_metrics(self) -> pd.DataFrame:
+        rows: list[dict] = []
+        for k in self.n_clusters:
+            labels = self.labels_[k]
+            seeds = self.seeds_[k]
+            for i, j in combinations(range(len(labels)), 2):
+                a, b = labels[i], labels[j]
+                rows.append(
+                    {
+                        "k": int(k),
+                        "run_i": int(i),
+                        "run_j": int(j),
+                        "seed_i": int(seeds[i]),
+                        "seed_j": int(seeds[j]),
+                        "fmi": float(fowlkes_mallows_score(a, b)),
+                        "ari": float(adjusted_rand_score(a, b)),
+                        "nmi": float(
+                            normalized_mutual_info_score(a, b, average_method="arithmetic")
+                        ),
+                    }
+                )
+        return pd.DataFrame(rows)
+
     @staticmethod
-    def _mean_pairwise_fmi(label_runs: Sequence[np.ndarray]) -> float:
-        vals = [
-            fowlkes_mallows_score(label_runs[i], label_runs[j])
-            for i, j in combinations(range(len(label_runs)), 2)
-        ]
-        return float(np.mean(vals)) if vals else np.nan
+    def _summary_stats(values: Sequence[float]) -> dict[str, float]:
+        arr = np.asarray(values, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return {
+                "mean": np.nan,
+                "median": np.nan,
+                "sd": np.nan,
+                "q25": np.nan,
+                "q75": np.nan,
+                "iqr": np.nan,
+            }
+        q25, q75 = np.percentile(arr, [25, 75])
+        return {
+            "mean": float(np.mean(arr)),
+            "median": float(np.median(arr)),
+            "sd": float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0,
+            "q25": float(q25),
+            "q75": float(q75),
+            "iqr": float(q75 - q25),
+        }
 
     @staticmethod
     def _mean_best_cross_fmi(
         labels_a: Sequence[np.ndarray], labels_b: Sequence[np.ndarray]
     ) -> float:
+        """Legacy adjacent-K FMI diagnostic retained from sat4sc v0.5."""
+
         if not labels_a or not labels_b:
             return np.nan
         vals = []
@@ -701,43 +838,139 @@ class ClusterAutoK:
             vals.append(max(fowlkes_mallows_score(b, a) for a in labels_a))
         return float(np.mean(vals))
 
+    def _representative_run_index(self, k: int, metric: str | None = None) -> int:
+        """Return the run most similar to all other runs at K."""
+
+        if self.pairwise_metrics_ is None:
+            raise RuntimeError("Pairwise stability metrics have not been computed.")
+        metric = self.primary_metric if metric is None else str(metric).lower()
+        if metric not in self._VALID_PRIMARY:
+            raise ValueError(f"metric must be one of {sorted(self._VALID_PRIMARY)}.")
+        sub = self.pairwise_metrics_[self.pairwise_metrics_["k"] == int(k)]
+        n_runs = len(self.labels_[int(k)])
+        scores = np.full(n_runs, np.nan, dtype=float)
+        for run in range(n_runs):
+            vals = pd.concat(
+                [
+                    sub.loc[sub["run_i"] == run, metric],
+                    sub.loc[sub["run_j"] == run, metric],
+                ],
+                ignore_index=True,
+            ).to_numpy(dtype=float)
+            if vals.size:
+                scores[run] = np.nanmean(vals)
+        if np.all(np.isnan(scores)):
+            return 0
+        return int(np.nanargmax(scores))
+
+    def _safe_silhouette(self, labels: np.ndarray, seed: int) -> float:
+        if self._x_fit is None:
+            return np.nan
+        unique = np.unique(labels)
+        if unique.size < 2 or unique.size >= labels.size:
+            return np.nan
+        sample_size = self.silhouette_sample_size
+        if sample_size is not None:
+            sample_size = min(int(sample_size), labels.size)
+            if sample_size <= unique.size:
+                sample_size = min(labels.size, int(unique.size) + 1)
+        try:
+            return float(
+                silhouette_score(
+                    self._x_fit,
+                    labels,
+                    metric=self.silhouette_metric,
+                    sample_size=sample_size,
+                    random_state=int(seed),
+                )
+            )
+        except ValueError:
+            warnings.warn(
+                "Silhouette score could not be computed for one clustering run; "
+                "NaN was recorded.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return np.nan
+
+    def _compute_silhouettes(self) -> None:
+        if self.run_metrics_ is None or self.silhouette_mode is None:
+            return
+        for k in self.n_clusters:
+            if self.silhouette_mode == "representative":
+                runs = [self._representative_run_index(k)]
+            else:
+                runs = list(range(self.max_runs))
+            for run in runs:
+                seed = self.seeds_[k][run]
+                score = self._safe_silhouette(self.labels_[k][run], seed)
+                mask = (self.run_metrics_["k"] == k) & (
+                    self.run_metrics_["run"] == run
+                )
+                self.run_metrics_.loc[mask, "silhouette"] = score
+
     def _summarize_stability(self) -> pd.DataFrame:
+        if self.pairwise_metrics_ is None:
+            raise RuntimeError("Pairwise metrics are unavailable.")
         rows = []
         kset = set(self.n_clusters)
         for k in self.n_clusters:
-            within = self._mean_pairwise_fmi(self.labels_[k])
-            prev = (
+            pair = self.pairwise_metrics_[self.pairwise_metrics_["k"] == k]
+            rep_run = self._representative_run_index(k)
+            row: dict[str, float | int | bool | str] = {
+                "k": int(k),
+                "n_runs": int(self.max_runs),
+                "n_pairs": int(len(pair)),
+                "representative_run": int(rep_run),
+                "representative_seed": int(self.seeds_[k][rep_run]),
+            }
+            for metric in ("fmi", "ari", "nmi"):
+                stats = self._summary_stats(pair[metric].to_numpy(dtype=float))
+                for stat, val in stats.items():
+                    row[f"{metric}_{stat}"] = val
+
+            # Backward-compatible v0.5 columns.
+            row["within_stability"] = row["fmi_mean"]
+            row["prev_similarity"] = (
                 self._mean_best_cross_fmi(self.labels_[k], self.labels_[k - 1])
                 if k - 1 in kset
                 else np.nan
             )
-            nxt = (
+            row["next_similarity"] = (
                 self._mean_best_cross_fmi(self.labels_[k], self.labels_[k + 1])
                 if k + 1 in kset
                 else np.nan
             )
-            rows.append(
-                {
-                    "k": k,
-                    "stability": within,
-                    "within_stability": within,
-                    "prev_similarity": prev,
-                    "next_similarity": nxt,
-                }
-            )
-        out = pd.DataFrame(rows).sort_values("k").reset_index(drop=True)
+            row["stability"] = row[f"{self.primary_metric}_mean"]
 
+            if self.run_metrics_ is not None:
+                run = self.run_metrics_[self.run_metrics_["k"] == k]
+                sil_stats = self._summary_stats(run["silhouette"].to_numpy(dtype=float))
+                for stat, val in sil_stats.items():
+                    row[f"silhouette_{stat}"] = val
+                finite_sil = run["silhouette"].dropna()
+                row["silhouette"] = (
+                    float(finite_sil.iloc[0])
+                    if self.silhouette_mode == "representative" and not finite_sil.empty
+                    else float(sil_stats["mean"])
+                )
+            else:
+                row["silhouette"] = np.nan
+            rows.append(row)
+
+        out = pd.DataFrame(rows).sort_values("k").reset_index(drop=True)
         is_peak = np.zeros(len(out), dtype=bool)
         if len(out) == 1:
             is_peak[0] = True
         elif len(out) >= 3:
-            s = out["stability"].to_numpy()
+            s = out["stability"].to_numpy(dtype=float)
             for i in range(1, len(out) - 1):
                 if s[i] >= s[i - 1] and s[i] >= s[i + 1] and (
                     s[i] > s[i - 1] or s[i] > s[i + 1]
                 ):
                     is_peak[i] = True
         out["is_peak"] = is_peak
+        out["primary_metric"] = self.primary_metric
         return out
 
     def fit(
@@ -750,7 +983,7 @@ class ClusterAutoK:
         max_cells_per_sample: int | None = None,
         annotate_fit_set: bool = True,
     ) -> "ClusterAutoK":
-        """Fit all candidate K values on either all cells or a balanced subset."""
+        """Fit all candidate K values on all cells or a sample-balanced subset."""
 
         x = _get_rep_matrix(adata, use_rep)
         if fit_indices is None and max_cells_per_sample is not None:
@@ -771,6 +1004,8 @@ class ClusterAutoK:
             fit_idx = np.asarray(fit_indices, dtype=np.int64)
             if fit_idx.ndim != 1 or fit_idx.size == 0:
                 raise ValueError("fit_indices must be a non-empty 1D integer array.")
+            if fit_idx.min() < 0 or fit_idx.max() >= adata.n_obs:
+                raise IndexError("fit_indices contains out-of-range cell indices.")
 
         x_fit = x[fit_idx]
         if x_fit.shape[0] <= max(self.n_clusters):
@@ -780,6 +1015,8 @@ class ClusterAutoK:
         self.use_rep_ = use_rep
         self._x_fit = x_fit
         self._fit_matrix(x_fit)
+        self.pairwise_metrics_ = self._build_pairwise_metrics()
+        self._compute_silhouettes()
         self.stability_ = self._summarize_stability()
         self.peaks_ = self.stability_.loc[
             self.stability_["is_peak"], "k"
@@ -794,11 +1031,11 @@ class ClusterAutoK:
         self.best_k_ = int(best_row["k"])
         return self
 
-    def get_model(self, k: int | None = None) -> GaussianMixture:
-        """Return the most internally representative run for a candidate K."""
+    def get_representative_run(self, k: int | None = None) -> int:
+        """Return the representative repeated-run index for K."""
 
         if self.stability_ is None:
-            raise RuntimeError("Call fit() before get_model().")
+            raise RuntimeError("Call fit() before get_representative_run().")
         if k is None:
             if self.best_k_ is None:
                 raise RuntimeError("best_k_ is unavailable.")
@@ -806,19 +1043,15 @@ class ClusterAutoK:
         k = int(k)
         if k not in self.models_:
             raise KeyError(f"K={k} was not fitted.")
+        return self._representative_run_index(k)
 
-        label_runs = self.labels_[k]
-        if len(label_runs) == 1:
-            return self.models_[k][0]
-        scores = np.zeros(len(label_runs), dtype=float)
-        for i in range(len(label_runs)):
-            others = [
-                fowlkes_mallows_score(label_runs[i], label_runs[j])
-                for j in range(len(label_runs))
-                if i != j
-            ]
-            scores[i] = np.mean(others)
-        return self.models_[k][int(np.argmax(scores))]
+    def get_model(self, k: int | None = None) -> GaussianMixture:
+        """Return the representative repeated GMM for a candidate K."""
+
+        run = self.get_representative_run(k)
+        if k is None:
+            k = self.best_k_
+        return self.models_[int(k)][run]
 
     def predict(
         self,
@@ -829,7 +1062,7 @@ class ClusterAutoK:
         key_added: str | None = None,
         store_probabilities: bool = True,
     ) -> np.ndarray:
-        """Predict all cells using a representative fitted GMM for K."""
+        """Predict all cells using the representative fitted GMM for K."""
 
         if self.stability_ is None:
             raise RuntimeError("Call fit() before predict().")
@@ -866,8 +1099,128 @@ class ClusterAutoK:
                 "use_rep": use_rep,
                 "max_runs": self.max_runs,
                 "covariance_type": self.covariance_type,
+                "primary_metric": self.primary_metric,
+                "representative_run": int(
+                    self.get_representative_run(int(model.n_components))
+                ),
             }
         return labels
+
+    def predict_all_k(
+        self,
+        adata: AnnData,
+        *,
+        use_rep: str | None = None,
+        key_prefix: str = "state_niche_k",
+        annotate_obs: bool = True,
+    ) -> pd.DataFrame:
+        """Predict a representative clustering for every fitted K.
+
+        This is intended for workflows that want to inspect the full K=2..20
+        solution path. It stores only one representative labeling per K, not
+        every repeated run, which avoids a very large all-cell output.
+        """
+
+        if self.stability_ is None:
+            raise RuntimeError("Call fit() before predict_all_k().")
+        if use_rep is None:
+            if self.use_rep_ is None:
+                raise RuntimeError("use_rep is unavailable.")
+            use_rep = self.use_rep_
+        x = _get_rep_matrix(adata, use_rep)
+        result: dict[str, np.ndarray] = {}
+        for k in self.n_clusters:
+            model = self.get_model(k)
+            labels = model.predict(x).astype(np.int32)
+            col = f"{key_prefix}{k}"
+            result[col] = labels
+            if annotate_obs:
+                adata.obs[col] = pd.Categorical(labels.astype(str))
+        return pd.DataFrame(result, index=adata.obs.index)
+
+    def save_results(
+        self,
+        output_dir: str | Path,
+        *,
+        prefix: str = "state_niche",
+    ) -> dict[str, Path]:
+        """Save stability summary, all pairwise metrics and per-run diagnostics."""
+
+        if self.stability_ is None or self.pairwise_metrics_ is None:
+            raise RuntimeError("Call fit() before save_results().")
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        paths = {
+            "stability": out / f"{prefix}_stability_summary.csv",
+            "pairwise": out / f"{prefix}_pairwise_stability.csv",
+            "runs": out / f"{prefix}_run_metrics.csv",
+        }
+        self.stability_.to_csv(paths["stability"], index=False)
+        self.pairwise_metrics_.to_csv(paths["pairwise"], index=False)
+        if self.run_metrics_ is not None:
+            self.run_metrics_.to_csv(paths["runs"], index=False)
+        return paths
+
+
+def scan_cluster_stability(
+    adata: AnnData,
+    *,
+    use_rep: str = DEFAULT_FEATURE_KEY,
+    n_clusters: Iterable[int] | tuple[int, int] = (2, 20),
+    max_runs: int = 10,
+    primary_metric: str = "ari",
+    silhouette_mode: str | None = "representative",
+    silhouette_sample_size: int | None = 5000,
+    covariance_type: str = "full",
+    reg_covar: float = 1e-6,
+    max_iter: int = 200,
+    n_init: int = 1,
+    random_state: int = 123,
+    fit_indices: np.ndarray | Sequence[int] | None = None,
+    sample_key: str | None = None,
+    max_cells_per_sample: int | None = None,
+    predict_all_k: bool = False,
+    key_prefix: str = "state_niche_k",
+    output_dir: str | Path | None = None,
+    output_prefix: str = "state_niche",
+) -> ClusterAutoK:
+    """Convenience interface for a full repeated-GMM stability scan.
+
+    The defaults match a statistically explicit workflow in which ARI is the
+    primary repeated-run stability metric, NMI and the legacy FMI are retained
+    as complementary metrics, and silhouette is reported separately as a
+    cluster-separation diagnostic.
+    """
+
+    autok = ClusterAutoK(
+        n_clusters=n_clusters,
+        max_runs=max_runs,
+        covariance_type=covariance_type,
+        reg_covar=reg_covar,
+        max_iter=max_iter,
+        random_state=random_state,
+        n_init=n_init,
+        primary_metric=primary_metric,
+        silhouette_mode=silhouette_mode,
+        silhouette_sample_size=silhouette_sample_size,
+    )
+    autok.fit(
+        adata,
+        use_rep=use_rep,
+        fit_indices=fit_indices,
+        sample_key=sample_key,
+        max_cells_per_sample=max_cells_per_sample,
+    )
+    if predict_all_k:
+        autok.predict_all_k(
+            adata,
+            use_rep=use_rep,
+            key_prefix=key_prefix,
+            annotate_obs=True,
+        )
+    if output_dir is not None:
+        autok.save_results(output_dir, prefix=output_prefix)
+    return autok
 
 
 def state_niche(
@@ -931,5 +1284,6 @@ __all__ = [
     "balanced_fit_indices",
     "fit",
     "ClusterAutoK",
+    "scan_cluster_stability",
     "state_niche",
 ]
